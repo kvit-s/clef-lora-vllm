@@ -18,7 +18,7 @@ It has four parts:
 - **a decision service** (`service/`) that tokenizes requests with Cloudflare's own code and answers
   in the same format as Clef's release and TypeSafe's Jev. Clef's scoring network runs either in the
   service on the CPU, from hidden states the plugin writes, or inside vLLM on the GPU
-  (`CLEF_GPU_HEAD=1` and `--gpu-head`), keeping prompt starts in NVFP4 in graphics memory.
+  (`CLEF_GPU_HEAD=1` and `--gpu-head`), keeping prompt starts in NVFP4 in system RAM or graphics memory.
   It reuses the start of prompts that grow at the end, such as a game's fixed rules plus a growing
   log, which on the reference setup took a 15,000-token decision from 2.7–3.0 s to 0.95–1.25 s;
 - **evaluation** (`eval/`): 72 test records with the answers of Clef at full precision, and
@@ -100,8 +100,10 @@ that was measured. vLLM's log should show `clef_capture: patched` and
 
 To run the scoring network on the GPU as well, also set `CLEF_GPU_HEAD=1` and
 `CLEF_RELEASE=/path/to/clef-release` (the directory from step 3, readable inside vLLM's container) and,
-optionally, `CLEF_GPU_STORE_MB` (default 512), and leave vLLM about 1 GB of graphics memory for it
-(on a full card, by lowering `--kv-cache-memory-bytes`). Start the service in step 3 with `--gpu-head`.
+optionally, `CLEF_GPU_STORE_MB` (default 512), `CLEF_STORE_DEVICE` (`cpu`, the default, or `cuda`) and
+`CLEF_GPU_HEAD_DTYPE` (`bfloat16`, the default, or `float32`). Leave the scoring about 0.5 GB of
+graphics memory with the defaults, about 1.6 GB with the store on the GPU (on a full card, by lowering
+`--kv-cache-memory-bytes`). Start the service in step 3 with `--gpu-head`.
 
 **3. Start the decision service.**
 

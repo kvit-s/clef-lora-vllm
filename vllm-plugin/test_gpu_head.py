@@ -3,7 +3,8 @@
 1. The store of prompt starts: kept rows found by their chain names, a growing prompt extended in
    place with its last blocks rewritten, a prompt departing earlier given its own segment, an
    unfinished segment released, the least recently used segment dropped first.
-2. The scorer against the decision service's CPU path on the 72 test records: the records' hidden
+2. The scorer (in fp32 and in bf16, the plugin's default) against the decision service's CPU path on
+   the 72 test records: the records' hidden
    states (saved by eval/reference.py, or made up) are fed to the scorer in chunks of 2,048 positions,
    as vLLM would, first from position 0 and then again with the start served from the store; the
    option probabilities are compared with the CPU path given the same NVFP4-rounded rows (they must
@@ -96,7 +97,21 @@ def test_store() -> None:
           "its own segment, unfinished segments released, least recently used dropped first")
 
 
-def test_scorer(release: Path, records_path: Path, reference: Path | None) -> None:
+def made_up_hidden(ids, size: int) -> torch.Tensor:
+    """Made-up hidden states that, like a causal model's, depend only on the tokens up to each position:
+    records sharing a start (all begin with Clef's fixed text) share its rows in the store, as real
+    hidden states would allow."""
+    import hashlib
+
+    rows, running = [], b""
+    for token in ids:
+        running = hashlib.sha256(running + int(token).to_bytes(4, "little")).digest()
+        generator = torch.Generator().manual_seed(int.from_bytes(running[:8], "little"))
+        rows.append(torch.randn(size, generator=generator) * 4)
+    return torch.stack(rows).to(torch.bfloat16)
+
+
+def test_scorer(release: Path, records_path: Path, reference: Path | None, dtype: str) -> None:
     import clef_code
 
     clef_code.use_release(["--release", str(release)])
@@ -114,7 +129,7 @@ def test_scorer(release: Path, records_path: Path, reference: Path | None) -> No
     lookup = OutputEmbeddingRows(release).as_tensor_lookup(torch.float32)
     size = json.loads((release / "joint_head_config.json").read_text())["hidden_size"]
     with tempfile.TemporaryDirectory() as directory:
-        scorer = GpuScorer(str(release), 512 * 2**20, directory)
+        scorer = GpuScorer(str(release), 512 * 2**20, directory, store_device="cpu", dtype=dtype)
         worst_same, worst_full, flips, count, reused = 0.0, 0.0, 0, 0, 0
         for line in open(records_path):
             record = json.loads(line)
@@ -125,8 +140,7 @@ def test_scorer(release: Path, records_path: Path, reference: Path | None) -> No
                 with np.load(npz) as data:
                     hidden = torch.from_numpy(data["hidden_bf16"].view(np.int16).copy()).view(torch.bfloat16)
             else:
-                generator = torch.Generator().manual_seed(sum(map(ord, record["id"])))
-                hidden = (torch.randn(len(ids), size, generator=generator) * 4).to(torch.bfloat16)
+                hidden = made_up_hidden(ids, size)
             needed = reuse.first_needed_position(encoded)
             cut = needed // 16 * 16
             spec = {"cut": cut, "questions": [{"type": int(q.question_type), "span": list(q.question_span),
@@ -150,10 +164,11 @@ def test_scorer(release: Path, records_path: Path, reference: Path | None) -> No
                     flips += int(a.argmax() != c.argmax())
                 reused += result["first_position"] > 0
             count += 1
-    print(f"GPU scorer on {count} records, read in full and with the start from its store ({reused} reused): "
-          f"largest difference from the CPU path with the same NVFP4 rows {worst_same:.2e}, "
+    print(f"GPU scorer in {dtype} on {count} records, read in full and with the start from its store "
+          f"({reused} reused): largest difference from the CPU path with the same NVFP4 rows {worst_same:.2e}, "
           f"from the CPU path at full precision {worst_full:.4f}; answers changed {flips}")
-    assert count == 72 and worst_same < 1e-4 and flips == 0
+    # fp32 must match the CPU path to rounding; bf16 moved probabilities by up to 0.0027 in Cloudflare's own run
+    assert count == 72 and flips == 0 and worst_same < (1e-4 if dtype == "float32" else 0.01)
 
 
 if __name__ == "__main__":
@@ -164,5 +179,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     torch.set_num_threads(8)
     test_store()
-    test_scorer(Path(args.release), Path(args.records), Path(args.reference_hidden) if args.reference_hidden else None)
+    for dtype in ("float32", "bfloat16"):
+        test_scorer(Path(args.release), Path(args.records), Path(args.reference_hidden) if args.reference_hidden else None,
+                    dtype)
     print("all passed")

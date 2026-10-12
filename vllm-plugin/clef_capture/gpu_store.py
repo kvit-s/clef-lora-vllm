@@ -1,4 +1,4 @@
-"""Key and value rows of recently read prompt starts, kept on the GPU in NVFP4 (packed.py).
+"""Key and value rows of recently read prompt starts, kept in NVFP4 (packed.py), in system RAM or on the GPU.
 
 The same rules as the decision service's CPU store (service/reuse.py PrefixStore): one buffer
 (segment) per prompt start, with blocks of 16 positions named by the SHA-256 chain of all token ids up
@@ -12,6 +12,11 @@ prompt. begin() reserves the segment and says from which position rows must be w
 and stores a range, finish() makes the new blocks findable, abort() releases a segment that was never
 finished. Everything runs in vLLM's engine thread, one call at a time; a segment being written by one
 request is not extended by another, which gets a segment of its own.
+
+The rows can live on another device than the one they are computed and used on: with the store in
+system RAM (pinned, so copies to and from the GPU are fast) and the scoring on the GPU, write() packs a
+chunk on the GPU and copies the packed bytes down, and view() copies one plane at a time up when the
+scoring network attends to it. That keeps graphics memory to the plane being used.
 """
 
 from __future__ import annotations
@@ -26,10 +31,13 @@ from . import packed
 
 
 class Segment:
-    def __init__(self, capacity: int, planes: int, width: int, device: torch.device) -> None:
-        self.codes = torch.empty(planes, capacity, width // 2, dtype=torch.uint8, device=device)
-        self.scales = torch.empty(planes, capacity, width // packed.BLOCK, dtype=torch.float8_e4m3fn, device=device)
-        self.row_scales = torch.empty(planes, capacity, dtype=torch.float32, device=device)
+    def __init__(self, capacity: int, planes: int, width: int, device: torch.device, pin: bool = False) -> None:
+        def empty(*shape, dtype):
+            return torch.empty(*shape, dtype=dtype, device=device, pin_memory=pin)
+
+        self.codes = empty(planes, capacity, width // 2, dtype=torch.uint8)
+        self.scales = empty(planes, capacity, width // packed.BLOCK, dtype=torch.float8_e4m3fn)
+        self.row_scales = empty(planes, capacity, dtype=torch.float32)
         self.length = 0                   # positions whose rows are valid and findable
         self.names: list[bytes] = []      # chain names of the findable blocks
         self.writer: str | None = None    # request appending to it, if any
@@ -44,20 +52,28 @@ class Segment:
 
 
 class RowsView:
-    """Rows of positions 0..upto of a segment; indexing by plane unpacks that plane only."""
+    """Rows of positions 0..upto of a segment; indexing by plane copies that plane to `device` (if the
+    store is elsewhere) and unpacks it there."""
 
-    def __init__(self, segment: Segment, upto: int, dtype: torch.dtype = torch.float32) -> None:
-        self.segment, self.upto, self.dtype = segment, upto, dtype
+    def __init__(self, segment: Segment, upto: int, dtype: torch.dtype = torch.float32,
+                 device: torch.device | None = None) -> None:
+        self.segment, self.upto, self.dtype, self.device = segment, upto, dtype, device
 
     def __getitem__(self, plane: int) -> torch.Tensor:
         s, n = self.segment, self.upto
-        return packed.unpack(s.codes[plane, :n], s.scales[plane, :n], s.row_scales[plane, :n], self.dtype)
+        parts = (s.codes[plane, :n], s.scales[plane, :n], s.row_scales[plane, :n])
+        if self.device is not None and parts[0].device != self.device:
+            parts = tuple(t.to(self.device, non_blocking=True) for t in parts)
+        return packed.unpack(*parts, self.dtype)
 
 
 class GpuStore:
     def __init__(self, budget_bytes: int, device: torch.device, planes: int = 12, width: int = 1024,
-                 block: int = 16, rewrite_blocks: int = 64) -> None:
-        self.budget, self.device, self.planes, self.width = budget_bytes, device, planes, width
+                 block: int = 16, rewrite_blocks: int = 64, compute_device: torch.device | None = None) -> None:
+        self.budget, self.device, self.planes, self.width = budget_bytes, torch.device(device), planes, width
+        self.compute_device = torch.device(compute_device) if compute_device is not None else self.device
+        # pinned host memory makes the copies to and from the GPU fast
+        self.pin = self.device.type == "cpu" and self.compute_device.type == "cuda"
         self.block, self.rewrite_blocks = block, rewrite_blocks
         self.per_position = planes * packed.bytes_per_row(width)
         self.segments: OrderedDict[int, Segment] = OrderedDict()   # oldest first
@@ -120,15 +136,15 @@ class GpuStore:
         return fresh, first
 
     def write(self, segment: Segment, start: int, rows: torch.Tensor) -> None:
-        """Store rows [planes, n, width] for positions start..start+n."""
+        """Store rows [planes, n, width] for positions start..start+n; packed where the rows are."""
         codes, scales, row_scales = packed.pack(rows)
         end = start + rows.shape[1]
-        segment.codes[:, start:end] = codes
-        segment.scales[:, start:end] = scales
-        segment.row_scales[:, start:end] = row_scales
+        segment.codes[:, start:end].copy_(codes)
+        segment.scales[:, start:end].copy_(scales)
+        segment.row_scales[:, start:end].copy_(row_scales)
 
-    def view(self, segment: Segment, upto: int) -> RowsView:
-        return RowsView(segment, upto)
+    def view(self, segment: Segment, upto: int, dtype: torch.dtype = torch.float32) -> RowsView:
+        return RowsView(segment, upto, dtype, self.compute_device)
 
     def finish(self, segment: Segment, cut: int) -> None:
         count = cut // self.block
@@ -158,7 +174,7 @@ class GpuStore:
         limit = self.budget // self.per_position
         room = max(positions, min(int(positions * 1.25), limit))
         capacity = -(-room // self.block) * self.block
-        return Segment(capacity, self.planes, self.width, self.device)
+        return Segment(capacity, self.planes, self.width, self.device, self.pin)
 
     def _reserve(self, segment: Segment, positions: int) -> None:
         if positions <= segment.capacity:

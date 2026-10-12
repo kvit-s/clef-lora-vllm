@@ -68,7 +68,7 @@ def _attend(module: torch.nn.MultiheadAttention, query: torch.Tensor, keys: list
     q = functional.linear(query, module.in_proj_weight[:width], module.in_proj_bias[:width])
     q = q.view(-1, heads, depth).transpose(0, 1)  # [heads, queries, depth]
     scores = torch.cat([torch.matmul(q, k.view(-1, heads, depth).permute(1, 2, 0)) for k in keys], dim=-1)
-    weights = (scores / math.sqrt(depth)).softmax(-1)
+    weights = (scores.float() / math.sqrt(depth)).softmax(-1).to(q.dtype)  # softmax in fp32 whatever the dtype
     out, start = 0, 0
     for v in values:
         out = out + torch.matmul(weights[..., start:start + v.shape[0]], v.view(-1, heads, depth).transpose(0, 1))

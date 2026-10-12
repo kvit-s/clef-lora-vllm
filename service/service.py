@@ -118,7 +118,8 @@ class VllmBackbone:
         finally:
             os.remove(path)
         timings = {"backbone_seconds": round(time.perf_counter() - started, 4),
-                   "gpu_scoring_seconds": result.get("scoring_seconds")}
+                   "gpu_scoring_seconds": result.get("scoring_seconds"),
+                   **{k: v for k, v in result.items() if k.startswith("cuda_")}}
         return result["first_position"], result["logits"], timings
 
     def _request(self, token_ids: list[int], reuse_cache: bool, reuse_limit: int, suffix: str,

@@ -294,56 +294,63 @@ answers. Nothing is sent back to the service but the option scores.
 What happens for one decision:
 
 1. The service sends, with the token ids, where the questions and options lie in the prompt
-   (`vllm_xargs` `clef_head`, as JSON text: the first question position rounded down to 16, and each
-   question's type, span and option spans).
+   (`vllm_xargs` `clef_head`, as JSON text, since vLLM accepts only flat values there: the first
+   question position rounded down to 16, and each question's type, span and option spans).
 2. Each time vLLM has computed a chunk of the prompt (at most 2,048 positions), the plugin turns the
    chunk's hidden states into the twelve key and value rows per position (`head.memory_kv`). Rows of
-   positions before the first question go straight into a store of prompt starts on the GPU, in
-   NVFP4 (`gpu_store.py`, `packed.py`: 6,960 bytes per position instead of 49,152 in fp32); the rows
-   and hidden states of the question positions, a few hundred, are kept at full precision for this
-   request only.
+   positions before the first question are packed into NVFP4 (`packed.py`: 6,960 bytes per position
+   instead of 49,152 in fp32) and kept in a store of prompt starts (`gpu_store.py`); the rows and hidden
+   states of the question positions, a few hundred, are kept on the GPU for this request only.
 3. If vLLM served the start of the prompt from its cache, the plugin finds that start's rows in its
    store by the chain of token-id hashes, as the CPU store does; if they are not there, it reports
    "not kept" and the service asks again with a `cache_salt`, which makes vLLM read the whole prompt.
 4. When every position has been seen, the plugin runs the rest of the network (`head.forward`) over
-   the stored rows, unpacked one attention layer at a time, and the kept ones, and writes the scores
-   to `CAPTURE_DIR/KEY.json`.
+   the stored rows, copied to the GPU and unpacked one attention layer at a time, and the kept ones,
+   and writes the scores to `CAPTURE_DIR/KEY.json`.
 
 The store follows the CPU store's rules (one buffer per prompt start, a growing prompt extended in
 place with its last blocks rewritten, a departing one given its own buffer, least recently used
-dropped first), within `CLEF_GPU_STORE_MB` (default 512). The network itself is loaded from Clef's
-release directory, mounted into vLLM's container and named by `CLEF_RELEASE`, on the first decision.
+dropped first), within `CLEF_GPU_STORE_MB` (default 512). It lives in pinned system RAM by default
+(`CLEF_STORE_DEVICE=cpu`) or in graphics memory (`CLEF_STORE_DEVICE=cuda`). The network runs in bf16 by
+default (`CLEF_GPU_HEAD_DTYPE=bfloat16`), with its attention softmax in fp32; in Cloudflare's own run
+on the 72 test records, the network in bf16 moved probabilities by at most 0.0027 against fp32 and
+changed no answer. It is loaded from Clef's release directory, mounted into vLLM's container and
+named by `CLEF_RELEASE`, on the first decision.
 
 Storing the rows in NVFP4 was checked on real hidden states before it was built: on six prompts of
 16,100 to 70,800 tokens, where 98% of each prompt came from stored rows, it moved probabilities by
 at most 0.0003 and changed none of 18 answers (`eval/row_precision.py`); bf16 and FP8 moved nothing
-measurable. On the CPU, the plugin's scorer agrees with the service's CPU path given the same NVFP4
-rows to 2 × 10⁻⁵ (`vllm-plugin/test_gpu_head.py`).
+measurable. On the CPU, the plugin's scorer in fp32 agrees with the service's CPU path given the same
+NVFP4 rows to 5 × 10⁻⁷, and in bf16 to 0.005 (`vllm-plugin/test_gpu_head.py`).
 
-Measured on the RTX 5090 setup, with `CLEF_FULL_CACHE_HITS=1` in both cases:
+Measured on the RTX 5090 setup, with `CLEF_FULL_CACHE_HITS=1` throughout, three ways of scoring:
 
-| Prompt | Read in full, scoring on the GPU | Read in full, on the CPU | Grown by four lines, GPU | Grown, CPU |
-|---:|---:|---:|---:|---:|
-| 1,015 tokens | 169–176 ms | about 219 ms | 165–183 ms | about 223 ms |
-| 4,002 tokens | 496 ms | 745 ms | 178 ms | 230 ms |
-| 8,019 tokens | 1,036 ms | 1,598 ms | 175–178 ms | 199 ms |
-| 16,002 tokens | 2,083–2,150 ms | 3,199 ms | 181–193 ms | 246 ms |
-| 32,013 tokens | 4,824–4,828 ms | 6,953 ms | 310–311 ms | 395 ms |
+| Prompt | On the CPU (service): read in full / start reused | GPU, fp32, store on the GPU | GPU, bf16, store in RAM |
+|---:|---:|---:|---:|
+| 4,002 tokens | 745 / 230 ms | 496 / 178 ms | 609 / 189 ms |
+| 8,019 tokens | 1,598 / 199 ms | 1,036 / 175–178 ms | 1,296 / 184 ms |
+| 16,002 tokens | 3,199 / 246 ms | 2,083–2,150 / 181–193 ms | 2,386 / 189 ms |
+| 32,013 tokens | 6,953 / 395 ms | 4,824–4,828 / 310–311 ms | 5,729 / 338 ms |
 
-The network's own share was 24–34 ms for a decision with a reused start and 26–108 ms for one read
-in full (108 ms at 32,000 tokens, against about 1.9 s on 8 CPU threads); the rest is vLLM. On the 72
-test records it got 84 of 85 known answers right, as the CPU path did on this server, with a median of
-166 ms per decision. On a 15,000-token game, reused decisions differed from full reads by at most
-0.158 in probability, against 0.162 between two full reads, and all twelve chose the same step.
-Fifteen decisions sent while a chat streamed took a median of 0.27 s, and the chat text was correct.
+| | On the CPU | GPU, fp32, store on the GPU | GPU, bf16, store in RAM |
+|---|---|---|---|
+| graphics memory for the scoring | none | about 1.6 GB on the card after a sweep to 32k | about 490 MiB, the same from 4k to 32k |
+| vLLM's key-value reservation | 5 GiB | 4 GiB | 4.5 GiB |
+| longest chat request | 194,000 tokens | 147,000 tokens | about 169,000 tokens |
+| system RAM | the service: 1.0 GB idle; 4.8 GB at most while reading a 32k prompt in full, 2.6 GB kept afterwards (2.9 and 1.8 GB at 16k) | the service: 0.57 GB | the service: 0.57 GB; vLLM's process about 1 GB more, mostly the store |
+| known test answers right | 84 of 85 | 84 of 85 | 84 of 85 |
 
-Graphics memory: the network's weights take 256 MB (fp32), the store up to its budget, and its work
-during a decision some hundreds of MB more. On the measured card, which has about 200 MiB free, that
-came out of vLLM's key-value reservation, cut from 5 to 4 GiB: the longest request went from 194,000
-to 147,000 tokens, and the card's memory in use ended about 140 MiB above the configuration without
-the network, with no more memory moved to system RAM. Chat speed and speculative acceptance were
-unchanged (264 tokens/s and 64% on that start, within the ±10% that varies from one vLLM start to the
-next).
+The network's own time on the GPU was 24–46 ms for a decision with a reused start; for one read in
+full it was 108 ms at 32k with the store on the GPU and 335 ms with the store in RAM, whose copies of
+each chunk's rows to RAM are synchronous. On a 15,000-token game (fp32, store on the GPU), reused
+decisions differed from full reads by at most 0.158 in probability, against 0.162 between two full
+reads, and all twelve chose the same step; fifteen decisions sent while a chat streamed took a median
+of 0.27 s, and the chat text was correct. Chat speed and speculative acceptance stayed within the
+±10% that varies from one vLLM start to the next (205–264 tokens/s, 57–64%).
+
+On the measured card, which has about 200 MiB free, the scoring's graphics memory has to come out of
+vLLM's key-value reservation; the reservations above were set so that the card's total ended where it
+is without the scoring (31,478–31,902 MiB against 31,531–31,759).
 
 ## Further speed-ups considered and not built
 

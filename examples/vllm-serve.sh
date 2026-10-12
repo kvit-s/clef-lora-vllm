@@ -21,7 +21,8 @@ export CLEF_LORA_LAYERS=40-63
 # DFlash2 fork of vLLM 0.27.2 only; see docs/how-it-works.md#how-much-vllm-reuses).
 # export CLEF_FULL_CACHE_HITS=1
 # Score decisions on the GPU inside vLLM (the decision service then runs with --gpu-head); needs
-# Clef's release files (service/fetch_release.py) and about 1 GB of graphics memory.
+# Clef's release files (service/fetch_release.py) and about 0.5 GB of graphics memory (network in bf16,
+# store of prompt starts in system RAM; CLEF_STORE_DEVICE=cuda keeps it on the GPU, about 1.6 GB).
 # export CLEF_GPU_HEAD=1 CLEF_RELEASE=/path/to/clef-release CLEF_GPU_STORE_MB=512
 
 exec vllm serve "$MODEL" \
