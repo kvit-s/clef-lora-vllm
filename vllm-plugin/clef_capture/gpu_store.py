@@ -42,6 +42,13 @@ class Segment:
         self.names: list[bytes] = []      # chain names of the findable blocks
         self.writer: str | None = None    # request appending to it, if any
         self.pending: list[bytes] = []    # names the writer will register on finish
+        self.copying = None               # CUDA event marking the end of copies into it still in flight
+
+    def wait(self) -> None:
+        """Before reading the segment on the CPU, wait for copies into it from the GPU to finish."""
+        if self.copying is not None:
+            self.copying.synchronize()
+            self.copying = None
 
     @property
     def capacity(self) -> int:
@@ -51,20 +58,33 @@ class Segment:
         return self.codes.numel() + self.scales.numel() + self.row_scales.numel() * 4
 
 
+class Plane:
+    """One plane (one attention layer's keys, or its values) of positions 0..upto of a segment, unpacked
+    on `device` a slice at a time, so that only a slice is ever in graphics memory."""
+
+    def __init__(self, segment: Segment, plane: int, upto: int, dtype: torch.dtype, device: torch.device | None) -> None:
+        self.segment, self.plane, self.upto, self.dtype, self.device = segment, plane, upto, dtype, device
+        self.shape = (upto, segment.codes.shape[2] * 2)
+
+    def slices(self, size: int = packed.SLICE):
+        s = self.segment
+        for start in range(0, self.upto, size):
+            end = min(start + size, self.upto)
+            parts = (s.codes[self.plane, start:end], s.scales[self.plane, start:end], s.row_scales[self.plane, start:end])
+            if self.device is not None and parts[0].device != self.device:
+                parts = tuple(t.to(self.device, non_blocking=True) for t in parts)
+            yield packed.unpack(*parts, self.dtype)
+
+
 class RowsView:
-    """Rows of positions 0..upto of a segment; indexing by plane copies that plane to `device` (if the
-    store is elsewhere) and unpacks it there."""
+    """Rows of positions 0..upto of a segment; indexing by plane gives that plane, unpacked lazily."""
 
     def __init__(self, segment: Segment, upto: int, dtype: torch.dtype = torch.float32,
                  device: torch.device | None = None) -> None:
         self.segment, self.upto, self.dtype, self.device = segment, upto, dtype, device
 
-    def __getitem__(self, plane: int) -> torch.Tensor:
-        s, n = self.segment, self.upto
-        parts = (s.codes[plane, :n], s.scales[plane, :n], s.row_scales[plane, :n])
-        if self.device is not None and parts[0].device != self.device:
-            parts = tuple(t.to(self.device, non_blocking=True) for t in parts)
-        return packed.unpack(*parts, self.dtype)
+    def __getitem__(self, plane: int) -> Plane:
+        return Plane(self.segment, plane, self.upto, self.dtype, self.device)
 
 
 class GpuStore:
@@ -127,6 +147,7 @@ class GpuStore:
                 return segment, matched * self.block
         fresh = self._allocate(cut)
         if first:
+            source.wait()
             fresh.codes[:, :first] = source.codes[:, :first]
             fresh.scales[:, :first] = source.scales[:, :first]
             fresh.row_scales[:, :first] = source.row_scales[:, :first]
@@ -136,12 +157,18 @@ class GpuStore:
         return fresh, first
 
     def write(self, segment: Segment, start: int, rows: torch.Tensor) -> None:
-        """Store rows [planes, n, width] for positions start..start+n; packed where the rows are."""
+        """Store rows [planes, n, width] for positions start..start+n. They are packed where they are; from
+        the GPU into pinned RAM the copies run without waiting (plane by plane, each a contiguous range)."""
         codes, scales, row_scales = packed.pack(rows)
         end = start + rows.shape[1]
-        segment.codes[:, start:end].copy_(codes)
-        segment.scales[:, start:end].copy_(scales)
-        segment.row_scales[:, start:end].copy_(row_scales)
+        asynchronous = self.pin and rows.is_cuda
+        for plane in range(rows.shape[0]):
+            segment.codes[plane, start:end].copy_(codes[plane], non_blocking=asynchronous)
+            segment.scales[plane, start:end].copy_(scales[plane], non_blocking=asynchronous)
+            segment.row_scales[plane, start:end].copy_(row_scales[plane], non_blocking=asynchronous)
+        if asynchronous:
+            segment.copying = torch.cuda.Event()
+            segment.copying.record()
 
     def view(self, segment: Segment, upto: int, dtype: torch.dtype = torch.float32) -> RowsView:
         return RowsView(segment, upto, dtype, self.compute_device)
@@ -180,6 +207,7 @@ class GpuStore:
         if positions <= segment.capacity:
             return
         grown = self._allocate(positions)
+        segment.wait()
         n = segment.length
         grown.codes[:, :n], grown.scales[:, :n], grown.row_scales[:, :n] = (
             segment.codes[:, :n], segment.scales[:, :n], segment.row_scales[:, :n])

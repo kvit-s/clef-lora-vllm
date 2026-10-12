@@ -172,9 +172,10 @@ with no measurable effect on chat. Details:
 |---|---|---|---|---|---|---|
 | RTX 5090, 32 GB | NVFP4 (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`), NVFP4 cache, DFlash draft model | 0.27.2.dev0 fork | 84 (later runs 83, 85) | 84 | 212 ms | 15% slower (243 → 206 tokens/s) |
 
-With the scoring network on the GPU and `CLEF_FULL_CACHE_HITS=1`, the same setup answered a decision
-whose prompt had grown in 175–193 ms up to 16,000 tokens and 311 ms at 32,000, and one read in full in
-1.04 s at 8,000 tokens and 4.8 s at 32,000 ([details](docs/how-it-works.md#the-scoring-network-on-the-gpu)).
+With the scoring network on the GPU (bf16, prompt starts in system RAM) and `CLEF_FULL_CACHE_HITS=1`,
+the same setup answered a decision whose prompt had grown in 146–187 ms up to 16,000 tokens and 293 ms
+at 32,000, and one read in full in 1.04 s at 8,000 tokens and 4.8 s at 32,000, for about 0.5 GB of
+graphics memory ([details](docs/how-it-works.md#the-scoring-network-on-the-gpu)).
 
 Measured earlier on the same setup, with the network on the CPU, `eval/latency_sweep.py` timed one question about prompts of 310 to 64,015
 tokens: 177 ms at 310 tokens, 1.4 s at 8,000 and about 17 s at 64,000 when read in full, and about

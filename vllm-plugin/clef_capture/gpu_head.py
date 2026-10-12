@@ -148,6 +148,8 @@ class GpuScorer:
         state.segment, state.write_from = reserved
         return state
 
+    SUB = 512  # positions turned into rows at a time, so that working memory stays small
+
     def _chunk(self, state: SimpleNamespace, start: int, hidden: torch.Tensor) -> None:
         end = start + hidden.shape[0]
         state.next = end
@@ -155,16 +157,18 @@ class GpuScorer:
         if lo >= end:
             return
         began = time.perf_counter()
-        h = hidden[lo - start:].to(self.dtype)
-        kv = clef_head.memory_kv(self.head, h)
-        split = min(max(state.cut, lo), end)
-        if split > lo:
-            self.store.write(state.segment, lo, kv[:, :split - lo])
-        if end > split:
-            state.tail_kv.append(kv[:, split - lo:])
-            state.tail_hidden.append(h[split - lo:])
-        if h.is_cuda:
-            torch.cuda.synchronize(h.device)  # so that the time counted is the work done
+        for a in range(lo, end, self.SUB):
+            b = min(a + self.SUB, end)
+            h = hidden[a - start:b - start].to(self.dtype)
+            kv = clef_head.memory_kv(self.head, h)
+            split = min(max(state.cut, a), b)
+            if split > a:
+                self.store.write(state.segment, a, kv[:, :split - a])
+            if b > split:
+                state.tail_kv.append(kv[:, split - a:])
+                state.tail_hidden.append(h[split - a:])
+        if hidden.is_cuda:
+            torch.cuda.synchronize(hidden.device)  # so that the time counted is the work done
         state.busy += time.perf_counter() - began
 
     def _finish(self, state: SimpleNamespace) -> None:

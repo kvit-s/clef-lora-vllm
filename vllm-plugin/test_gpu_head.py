@@ -42,7 +42,7 @@ def rows_for(ids):
 
 def stored(store, segment, upto):
     view = store.view(segment, upto)
-    return torch.stack([view[p] for p in range(PLANES)])
+    return torch.stack([torch.cat(list(view[p].slices(size=40))) for p in range(PLANES)])
 
 
 def rounded(rows):
@@ -109,6 +109,29 @@ def made_up_hidden(ids, size: int) -> torch.Tensor:
         generator = torch.Generator().manual_seed(int.from_bytes(running[:8], "little"))
         rows.append(torch.randn(size, generator=generator) * 4)
     return torch.stack(rows).to(torch.bfloat16)
+
+
+def test_streaming_attention() -> None:
+    """Attention over parts given a slice at a time agrees with attention over whole tensors."""
+    from types import SimpleNamespace
+
+    from clef_capture import head
+
+    torch.manual_seed(1)
+    module = torch.nn.MultiheadAttention(64, 4, batch_first=True)
+    query = torch.randn(9, 64)
+    keys = [torch.randn(300, 64) * 3, torch.randn(77, 64)]
+    values = [torch.randn(300, 64), torch.randn(77, 64)]
+
+    def sliced(t, size):
+        return SimpleNamespace(slices=lambda: (t[i:i + size] for i in range(0, t.shape[0], size)), shape=t.shape)
+
+    with torch.inference_mode():
+        whole = head._attend(module, query, keys, values)
+        streamed = head._attend(module, query, [sliced(keys[0], 23), keys[1]], [sliced(values[0], 23), values[1]])
+    difference = float((whole - streamed).abs().max())
+    assert difference < 1e-5, difference
+    print(f"attention streamed in slices of 23 positions agrees with the whole computation to {difference:.1e}")
 
 
 def test_scorer(release: Path, records_path: Path, reference: Path | None, dtype: str) -> None:
@@ -179,6 +202,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     torch.set_num_threads(8)
     test_store()
+    test_streaming_attention()
     for dtype in ("float32", "bfloat16"):
         test_scorer(Path(args.release), Path(args.records), Path(args.reference_hidden) if args.reference_hidden else None,
                     dtype)

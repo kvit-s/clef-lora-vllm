@@ -56,25 +56,50 @@ def memory_kv(head: JointSchemaHead, hidden: torch.Tensor) -> torch.Tensor:
     return torch.stack(rows)
 
 
-def _attend(module: torch.nn.MultiheadAttention, query: torch.Tensor, keys: list[torch.Tensor],
-            values: list[torch.Tensor]) -> torch.Tensor:
+def _attend(module: torch.nn.MultiheadAttention, query: torch.Tensor, keys: list, values: list) -> torch.Tensor:
     """nn.MultiheadAttention(query, memory, memory) for one unbatched sequence, with the memory's key
     and value projections already applied. The memory may come in several parts (consecutive
     positions); one softmax runs over all of them, so they never have to be joined. With a few
     queries against tens of thousands of positions this is also faster on the CPU than
-    scaled_dot_product_attention."""
+    scaled_dot_product_attention. A part may be a tensor or an object with .slices() that yields the
+    part's rows a slice at a time (gpu_store.Plane); then the softmax is computed as the slices go by
+    (a running maximum and sum, in fp32), so only one slice is ever unpacked."""
     width, heads = module.embed_dim, module.num_heads
     depth = width // heads
     q = functional.linear(query, module.in_proj_weight[:width], module.in_proj_bias[:width])
     q = q.view(-1, heads, depth).transpose(0, 1)  # [heads, queries, depth]
-    scores = torch.cat([torch.matmul(q, k.view(-1, heads, depth).permute(1, 2, 0)) for k in keys], dim=-1)
-    weights = (scores.float() / math.sqrt(depth)).softmax(-1).to(q.dtype)  # softmax in fp32 whatever the dtype
-    out, start = 0, 0
-    for v in values:
-        out = out + torch.matmul(weights[..., start:start + v.shape[0]], v.view(-1, heads, depth).transpose(0, 1))
-        start += v.shape[0]
+    if not all(torch.is_tensor(k) for k in keys):
+        out = _attend_streaming(q, keys, values, depth)
+    else:
+        scores = torch.cat([torch.matmul(q, k.view(-1, heads, depth).permute(1, 2, 0)) for k in keys], dim=-1)
+        weights = (scores.float() / math.sqrt(depth)).softmax(-1).to(q.dtype)  # softmax in fp32 whatever the dtype
+        out, start = 0, 0
+        for v in values:
+            out = out + torch.matmul(weights[..., start:start + v.shape[0]], v.view(-1, heads, depth).transpose(0, 1))
+            start += v.shape[0]
     out = out.transpose(0, 1).reshape(-1, width)
     return functional.linear(out, module.out_proj.weight, module.out_proj.bias)
+
+
+def _slices(part):
+    return part.slices() if hasattr(part, "slices") else [part]
+
+
+def _attend_streaming(q: torch.Tensor, keys: list, values: list, depth: int) -> torch.Tensor:
+    heads = q.shape[0]
+    peak = torch.full((*q.shape[:2], 1), float("-inf"), device=q.device)
+    total = torch.zeros((*q.shape[:2], 1), device=q.device)
+    acc = torch.zeros(q.shape, device=q.device)
+    for key_part, value_part in zip(keys, values):
+        for k, v in zip(_slices(key_part), _slices(value_part)):
+            scores = torch.matmul(q, k.view(-1, heads, depth).permute(1, 2, 0)).float() / math.sqrt(depth)
+            new_peak = torch.maximum(peak, scores.amax(-1, keepdim=True))
+            weights = torch.exp(scores - new_peak)
+            correction = torch.exp(peak - new_peak)
+            total = total * correction + weights.sum(-1, keepdim=True)
+            acc = acc * correction + torch.matmul(weights, v.view(-1, heads, depth).transpose(0, 1).float())
+            peak = new_peak
+    return (acc / total).to(q.dtype)
 
 
 def forward(

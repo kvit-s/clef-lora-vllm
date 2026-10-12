@@ -305,8 +305,12 @@ What happens for one decision:
    store by the chain of token-id hashes, as the CPU store does; if they are not there, it reports
    "not kept" and the service asks again with a `cache_salt`, which makes vLLM read the whole prompt.
 4. When every position has been seen, the plugin runs the rest of the network (`head.forward`) over
-   the stored rows, copied to the GPU and unpacked one attention layer at a time, and the kept ones,
-   and writes the scores to `CAPTURE_DIR/KEY.json`.
+   the stored rows and the kept ones, and writes the scores to `CAPTURE_DIR/KEY.json`. The stored rows
+   reach the attention 4,096 positions at a time (copied up and unpacked per slice), with the softmax
+   kept as a running maximum and sum in fp32, so graphics memory does not grow with the prompt.
+
+Rows are computed 512 positions at a time, and packed rows are copied down to the store in RAM
+without making vLLM wait; anything that reads them on the CPU side first waits for the copy.
 
 The store follows the CPU store's rules (one buffer per prompt start, a growing prompt extended in
 place with its last blocks rewritten, a departing one given its own buffer, least recently used
@@ -325,32 +329,35 @@ NVFP4 rows to 5 × 10⁻⁷, and in bf16 to 0.005 (`vllm-plugin/test_gpu_head.py
 
 Measured on the RTX 5090 setup, with `CLEF_FULL_CACHE_HITS=1` throughout, three ways of scoring:
 
-| Prompt | On the CPU (service): read in full / start reused | GPU, fp32, store on the GPU | GPU, bf16, store in RAM |
+| Prompt | On the CPU (service): read in full / start reused | GPU, fp32, store on the GPU | GPU, bf16, store in RAM (the default) |
 |---:|---:|---:|---:|
-| 4,002 tokens | 745 / 230 ms | 496 / 178 ms | 609 / 189 ms |
-| 8,019 tokens | 1,598 / 199 ms | 1,036 / 175–178 ms | 1,296 / 184 ms |
-| 16,002 tokens | 3,199 / 246 ms | 2,083–2,150 / 181–193 ms | 2,386 / 189 ms |
-| 32,013 tokens | 6,953 / 395 ms | 4,824–4,828 / 310–311 ms | 5,729 / 338 ms |
+| 4,002 tokens | 745 / 230 ms | 496 / 178 ms | 506 / 146 ms |
+| 8,019 tokens | 1,598 / 199 ms | 1,036 / 175–178 ms | 1,035 / 170 ms |
+| 16,002 tokens | 3,199 / 246 ms | 2,083–2,150 / 181–193 ms | 2,121 / 187 ms |
+| 32,013 tokens | 6,953 / 395 ms | 4,824–4,828 / 310–311 ms | 4,762 / 293 ms |
 
 | | On the CPU | GPU, fp32, store on the GPU | GPU, bf16, store in RAM |
 |---|---|---|---|
-| graphics memory for the scoring | none | about 1.6 GB on the card after a sweep to 32k | about 490 MiB, the same from 4k to 32k |
-| vLLM's key-value reservation | 5 GiB | 4 GiB | 4.5 GiB |
-| longest chat request | 194,000 tokens | 147,000 tokens | about 169,000 tokens |
+| graphics memory for the scoring | none | about 1.6 GB on the card after a sweep to 32k | about 490 MiB on the card (PyTorch's own memory grew 350 MB at most), the same from 4k to 32k |
+| vLLM's key-value reservation | 5 GiB | 4 GiB | 4.75 GiB |
+| longest chat request | 194,000 tokens | 147,000 tokens | 181,000 tokens (182,279 slots) |
 | system RAM | the service: 1.0 GB idle; 4.8 GB at most while reading a 32k prompt in full, 2.6 GB kept afterwards (2.9 and 1.8 GB at 16k) | the service: 0.57 GB | the service: 0.57 GB; vLLM's process about 1 GB more, mostly the store |
 | known test answers right | 84 of 85 | 84 of 85 | 84 of 85 |
 
-The network's own time on the GPU was 24–46 ms for a decision with a reused start; for one read in
-full it was 108 ms at 32k with the store on the GPU and 335 ms with the store in RAM, whose copies of
-each chunk's rows to RAM are synchronous. On a 15,000-token game (fp32, store on the GPU), reused
-decisions differed from full reads by at most 0.158 in probability, against 0.162 between two full
-reads, and all twelve chose the same step; fifteen decisions sent while a chat streamed took a median
-of 0.27 s, and the chat text was correct. Chat speed and speculative acceptance stayed within the
-±10% that varies from one vLLM start to the next (205–264 tokens/s, 57–64%).
+The network's own time on the GPU was 13–52 ms for a decision with a reused start; for one read in
+full it was 108 ms at 32k with the store on the GPU and 195 ms with the store in RAM. On a 15,000-token
+game, reused decisions differed from full reads by at most 0.158 in probability (fp32, store on the
+GPU; 0.086 with the defaults), against 0.162 (0.114) between two full reads, and every decision chose
+the same step; fifteen decisions sent while a chat streamed took a median of 0.27 s, and the chat text
+was correct. Chat speed and speculative acceptance stayed within the ±10% that varies from one vLLM
+start to the next (205–264 tokens/s, 57–67%); with the defaults at 4.75 GiB, chat decoded at 263
+tokens/s, and PCIe traffic during it stayed at the level of the idle desktop.
 
-On the measured card, which has about 200 MiB free, the scoring's graphics memory has to come out of
-vLLM's key-value reservation; the reservations above were set so that the card's total ended where it
-is without the scoring (31,478–31,902 MiB against 31,531–31,759).
+On the measured card, which has little free memory, the scoring's graphics memory has to come out of
+vLLM's key-value reservation, or Windows moves card memory to system RAM. Reading long prompts makes
+vLLM itself hold more memory too: with the same decisions up to 16k, the production configuration (CPU
+scoring, 5 GiB) went from 31,663 to 31,897 MiB on the card, and the defaults at 4.75 GiB from 31,183 to
+31,675 MiB, about 220 MiB below it.
 
 ## Further speed-ups considered and not built
 
