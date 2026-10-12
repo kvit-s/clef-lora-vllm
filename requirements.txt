@@ -1,0 +1,9 @@
+# The decision service, the evaluation scripts and the adapter extraction.
+# Tested with Python 3.12 and the versions below; torch can be the CPU build, since nothing here
+# uses a GPU (vLLM runs in its own environment).
+numpy>=2.0
+scipy>=1.13           # adapter extraction only
+safetensors>=0.4
+tokenizers>=0.22
+torch>=2.11
+transformers>=5.10

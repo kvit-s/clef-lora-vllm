@@ -1,0 +1,23 @@
+# A systemd user unit for the decision service. Copy it to ~/.config/systemd/user/, set the paths,
+# then: systemctl --user daemon-reload && systemctl --user enable --now clef-decider
+[Unit]
+Description=Clef decision service: SystemOne requests answered by Qwen3.8-27B with the Clef adapter in vLLM
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=CLEF_RELEASE=%h/clef-release
+ExecStartPre=/usr/bin/mkdir -p /dev/shm/clef-hidden
+ExecStartPre=-/usr/bin/chmod 0777 /dev/shm/clef-hidden
+ExecStart=%h/clef-lora-vllm/.venv/bin/python -I %h/clef-lora-vllm/service/service.py \
+    --vllm http://127.0.0.1:8000 \
+    --adapter clef \
+    --capture-dir /dev/shm/clef-hidden \
+    --listen 127.0.0.1:8091 \
+    --threads 8 \
+    --reuse-memory-mb 2048
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

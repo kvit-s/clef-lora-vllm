@@ -1,0 +1,258 @@
+[
+ {
+  "record": "arc-ACTAAP_2014_5_8",
+  "tokens": 227,
+  "clef": {
+   "relative_error": 0.44980496168136597,
+   "cosine_mean": 0.9058094620704651,
+   "cosine_min": 0.3396662473678589,
+   "last_position_cosine": 0.9626830816268921
+  },
+  "plain": {
+   "relative_error": 1.1439865827560425,
+   "cosine_mean": 0.3883804380893707,
+   "cosine_min": -0.15355168282985687,
+   "last_position_cosine": -0.15355168282985687
+  }
+ },
+ {
+  "record": "arc-AKDE&ED_2008_4_19",
+  "tokens": 195,
+  "clef": {
+   "relative_error": 0.38408342003822327,
+   "cosine_mean": 0.9288056492805481,
+   "cosine_min": 0.30373474955558777,
+   "last_position_cosine": 0.9678016901016235
+  },
+  "plain": {
+   "relative_error": 1.1606358289718628,
+   "cosine_mean": 0.36178261041641235,
+   "cosine_min": -0.12616287171840668,
+   "last_position_cosine": -0.12616287171840668
+  }
+ },
+ {
+  "record": "arc-AKDE&ED_2008_4_25",
+  "tokens": 190,
+  "clef": {
+   "relative_error": 0.39121511578559875,
+   "cosine_mean": 0.927230179309845,
+   "cosine_min": 0.33626747131347656,
+   "last_position_cosine": 0.9533287286758423
+  },
+  "plain": {
+   "relative_error": 1.1799829006195068,
+   "cosine_mean": 0.34229856729507446,
+   "cosine_min": -0.18303048610687256,
+   "last_position_cosine": -0.18303048610687256
+  }
+ },
+ {
+  "record": "arc-MCAS_2002_8_11",
+  "tokens": 236,
+  "clef": {
+   "relative_error": 0.40202608704566956,
+   "cosine_mean": 0.92400062084198,
+   "cosine_min": 0.19656886160373688,
+   "last_position_cosine": 0.9832003116607666
+  },
+  "plain": {
+   "relative_error": 1.122522234916687,
+   "cosine_mean": 0.3973619043827057,
+   "cosine_min": -0.0963028073310852,
+   "last_position_cosine": -0.0963028073310852
+  }
+ },
+ {
+  "record": "arc-MCAS_2003_8_11",
+  "tokens": 193,
+  "clef": {
+   "relative_error": 0.4115966558456421,
+   "cosine_mean": 0.9209543466567993,
+   "cosine_min": 0.2846408188343048,
+   "last_position_cosine": 0.9748121500015259
+  },
+  "plain": {
+   "relative_error": 1.1855703592300415,
+   "cosine_mean": 0.3390350341796875,
+   "cosine_min": -0.12888462841510773,
+   "last_position_cosine": -0.12888462841510773
+  }
+ },
+ {
+  "record": "arc-MCAS_2004_9_15-v1",
+  "tokens": 224,
+  "clef": {
+   "relative_error": 0.4049690365791321,
+   "cosine_mean": 0.9219773411750793,
+   "cosine_min": 0.3362899720668793,
+   "last_position_cosine": 0.9671599864959717
+  },
+  "plain": {
+   "relative_error": 1.1338270902633667,
+   "cosine_mean": 0.38676586747169495,
+   "cosine_min": -0.09963254630565643,
+   "last_position_cosine": -0.09963254630565643
+  }
+ },
+ {
+  "record": "arc-MCAS_2006_9_44",
+  "tokens": 252,
+  "clef": {
+   "relative_error": 0.4226822257041931,
+   "cosine_mean": 0.9165436625480652,
+   "cosine_min": 0.38284415006637573,
+   "last_position_cosine": 0.8969941139221191
+  },
+  "plain": {
+   "relative_error": 1.1193419694900513,
+   "cosine_mean": 0.4125522971153259,
+   "cosine_min": -0.15458369255065918,
+   "last_position_cosine": -0.15458369255065918
+  }
+ },
+ {
+  "record": "arc-MCAS_2014_5_7",
+  "tokens": 252,
+  "clef": {
+   "relative_error": 0.4186669588088989,
+   "cosine_mean": 0.9150260090827942,
+   "cosine_min": 0.1890680193901062,
+   "last_position_cosine": 0.9549559354782104
+  },
+  "plain": {
+   "relative_error": 1.0992133617401123,
+   "cosine_mean": 0.4136046767234802,
+   "cosine_min": -0.12438102066516876,
+   "last_position_cosine": -0.12438102066516876
+  }
+ },
+ {
+  "record": "arc-MDSA_2007_8_3",
+  "tokens": 240,
+  "clef": {
+   "relative_error": 0.39908066391944885,
+   "cosine_mean": 0.9240022897720337,
+   "cosine_min": 0.4128679931163788,
+   "last_position_cosine": 0.9609655141830444
+  },
+  "plain": {
+   "relative_error": 1.1227415800094604,
+   "cosine_mean": 0.3958331048488617,
+   "cosine_min": -0.17128002643585205,
+   "last_position_cosine": -0.17128002643585205
+  }
+ },
+ {
+  "record": "arc-Mercury_400407",
+  "tokens": 202,
+  "clef": {
+   "relative_error": 0.3850574195384979,
+   "cosine_mean": 0.9288114309310913,
+   "cosine_min": 0.30122607946395874,
+   "last_position_cosine": 0.9800170063972473
+  },
+  "plain": {
+   "relative_error": 1.1748212575912476,
+   "cosine_mean": 0.3471028506755829,
+   "cosine_min": -0.12410096824169159,
+   "last_position_cosine": -0.12410096824169159
+  }
+ },
+ {
+  "record": "arc-Mercury_400687",
+  "tokens": 183,
+  "clef": {
+   "relative_error": 0.38180267810821533,
+   "cosine_mean": 0.9318142533302307,
+   "cosine_min": 0.35311323404312134,
+   "last_position_cosine": 0.9725561141967773
+  },
+  "plain": {
+   "relative_error": 1.1788333654403687,
+   "cosine_mean": 0.3549633026123047,
+   "cosine_min": -0.13113179802894592,
+   "last_position_cosine": -0.13113179802894592
+  }
+ },
+ {
+  "record": "arc-Mercury_402216",
+  "tokens": 265,
+  "clef": {
+   "relative_error": 0.4038328230381012,
+   "cosine_mean": 0.9230660200119019,
+   "cosine_min": 0.28489142656326294,
+   "last_position_cosine": 0.9782025814056396
+  },
+  "plain": {
+   "relative_error": 1.1036288738250732,
+   "cosine_mean": 0.41750070452690125,
+   "cosine_min": -0.1453658938407898,
+   "last_position_cosine": -0.1453658938407898
+  }
+ },
+ {
+  "record": "arc-Mercury_404894",
+  "tokens": 194,
+  "clef": {
+   "relative_error": 0.4193170964717865,
+   "cosine_mean": 0.9173860549926758,
+   "cosine_min": 0.30906108021736145,
+   "last_position_cosine": 0.9673486948013306
+  },
+  "plain": {
+   "relative_error": 1.165717363357544,
+   "cosine_mean": 0.3576575517654419,
+   "cosine_min": -0.1888052225112915,
+   "last_position_cosine": -0.1888052225112915
+  }
+ },
+ {
+  "record": "arc-Mercury_407327",
+  "tokens": 233,
+  "clef": {
+   "relative_error": 0.38505056500434875,
+   "cosine_mean": 0.929725706577301,
+   "cosine_min": 0.3380647301673889,
+   "last_position_cosine": 0.9770302772521973
+  },
+  "plain": {
+   "relative_error": 1.112420916557312,
+   "cosine_mean": 0.41285187005996704,
+   "cosine_min": -0.1397465020418167,
+   "last_position_cosine": -0.1397465020418167
+  }
+ },
+ {
+  "record": "arc-Mercury_412202",
+  "tokens": 257,
+  "clef": {
+   "relative_error": 0.3837786912918091,
+   "cosine_mean": 0.9320135116577148,
+   "cosine_min": 0.40298280119895935,
+   "last_position_cosine": 0.9761027097702026
+  },
+  "plain": {
+   "relative_error": 1.1823385953903198,
+   "cosine_mean": 0.3535799980163574,
+   "cosine_min": -0.100016288459301,
+   "last_position_cosine": -0.100016288459301
+  }
+ },
+ {
+  "record": "arc-Mercury_7012740",
+  "tokens": 198,
+  "clef": {
+   "relative_error": 0.4223966598510742,
+   "cosine_mean": 0.9155418276786804,
+   "cosine_min": 0.2706153988838196,
+   "last_position_cosine": 0.9776957631111145
+  },
+  "plain": {
+   "relative_error": 1.1530992984771729,
+   "cosine_mean": 0.3687085211277008,
+   "cosine_min": -0.19468386471271515,
+   "last_position_cosine": -0.19468386471271515
+  }
+ }
+]

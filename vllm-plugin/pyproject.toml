@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clef-capture"
+version = "0.1.0"
+description = "vLLM plugin: write the final hidden states of marked prompts to files, for the Clef decision head"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+clef_capture = "clef_capture:register"
+
+[tool.setuptools]
+packages = ["clef_capture"]

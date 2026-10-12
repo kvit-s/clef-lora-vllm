@@ -1,0 +1,91 @@
+# Clef decision mode on the RTX 5090 setup this repository was built on: an overlay for the
+# DFlash2 vLLM project (seanyourhighness/vllm-sm12x-nvfp4-dflash2), which serves
+# gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 with a DFlash speculative draft model.
+#
+# Use it beside that project's compose.yaml:
+#   docker compose -f compose.yaml -f /path/to/compose.clef.yaml up -d server
+#
+# What it changes:
+# - the image is the project's image plus the clef_capture plugin, built from this repository:
+#     docker build -t vllm-dflash2-clef:dev \
+#       --build-arg BASE=ghcr.io/seanyourhighness/vllm-sm12x-nvfp4-dflash2@sha256:48436de2f21d9eb77c9a4a7697e16227de12b0ea46638d95f09da0b27f436974 \
+#       vllm-plugin
+#   Requests that do not ask for capture are untouched by it.
+# - the Clef adapter (rank 256, layers 40-63) is loaded under the model name "clef";
+#   CLEF_LORA_LAYERS keeps vLLM from reserving adapter buffers in layers 0-39.
+# - the host's /dev/shm is mounted at /host-shm, and the plugin writes hidden states to
+#   /host-shm/clef-hidden, where the decision service on the host reads them as
+#   /dev/shm/clef-hidden. The plugin creates that directory when it is missing, as it is after a
+#   reboot, and makes it writable by everyone. Mounting the directory itself would not work then:
+#   Docker would create it owned by root, and the container's vllm user could not write to it.
+# - the conversation memory is smaller to make room for the adapter, and the longest request is
+#   shortened to match: 5 GiB and 194,000 tokens, against 6.5 GiB and 262,144 without the adapter.
+#   vLLM measured that 194,000 fit in 5 GiB with the adapter loaded; 196,608 needs 5.05 GiB.
+#   Both can be changed: CLEF_KV_CACHE_MEMORY_BYTES, CLEF_MAX_MODEL_LEN.
+# Everything else in the command is the project's command, with this setup's settings.
+
+services:
+  server:
+    image: vllm-dflash2-clef:dev
+    environment:
+      CLEF_CAPTURE_DIR: /host-shm/clef-hidden
+      CLEF_LORA_LAYERS: "40-63"
+    volumes:
+      - ${CLEF_ADAPTER_DIR:?set CLEF_ADAPTER_DIR to the adapter directory}:/models/clef-adapter:ro
+      - /dev/shm:/host-shm
+    command:
+      - --model
+      - ${SERVER_MODEL:-${MODEL_ID}}
+      - --revision
+      - ${MODEL_REVISION}
+      - --speculative-config
+      - '{"method":"dflash","model":"/models/draft","num_speculative_tokens":${NUM_SPECULATIVE_TOKENS},"kv_cache_dtype":"${DRAFT_KV_CACHE_DTYPE}","num_speculative_tokens_per_batch_size":${DYNAMIC_SCHEDULE:-null}}'
+      - --served-model-name
+      - ${SERVED_MODEL_NAME}
+      - --quantization
+      - modelopt
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --default-chat-template-kwargs
+      - '{"enable_thinking":true,"reasoning_effort":"low"}'
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --chat-template
+      - /opt/vllm-release/chat-template.jinja
+      - --enable-mm-embeds
+      - --limit-mm-per-prompt
+      - '{"image":0,"video":0}'
+      - --kv-cache-dtype
+      - nvfp4
+      - --kv-cache-memory-bytes
+      - "${CLEF_KV_CACHE_MEMORY_BYTES:-5368709120}"
+      - --mamba-ssm-cache-dtype
+      - "${MAMBA_SSM_CACHE_DTYPE:-float32}"
+      - --max-model-len
+      - "${CLEF_MAX_MODEL_LEN:-194000}"
+      - --max-num-seqs
+      - "${MAX_NUM_SEQS}"
+      - --max-num-batched-tokens
+      - "${MAX_NUM_BATCHED_TOKENS}"
+      - --long-prefill-token-threshold
+      - "2048"
+      - --scheduling-policy
+      - priority
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --compilation-config
+      - '{"cudagraph_mode":"${CUDAGRAPH_MODE}","cudagraph_capture_sizes":${CUDAGRAPH_CAPTURE_SIZES}}'
+      - --attention-config
+      - '{"flash_attn_version":2}'
+      # Clef decision mode
+      - --enable-lora
+      - --max-lora-rank
+      - "256"
+      - --max-loras
+      - "1"
+      - --max-cpu-loras
+      - "1"
+      - --lora-modules
+      - clef=/models/clef-adapter

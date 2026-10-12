@@ -1,0 +1,10 @@
+# built by eval/build_records.py from the public datasets; not redistributed here
+eval/records.jsonl
+# release files, adapters and hidden states are downloaded or built, never committed
+*.safetensors
+*.npz
+work/
+__pycache__/
+*.pyc
+compare-hidden.json
+!examples/rtx5090-nvfp4-dflash2/compare-hidden.json

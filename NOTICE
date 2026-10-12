@@ -1,0 +1,22 @@
+clef-lora-vllm
+Copyright 2026 kvit-s
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+
+It works with Cloudflare's Clef (https://huggingface.co/Cloudflare/clef) and with Qwen3.8-27B
+(https://huggingface.co/Qwen/Qwen3.8-27B), both released under the Apache License, Version 2.0.
+
+The LoRA adapter that extract/extract_adapter.py builds, and that is published alongside this
+repository, is derived from the weights of Clef at revision
+2f3de3dd85f379784083b0814d997ab627200f0c and of Qwen3.8-27B at revision
+1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0: it is the difference between the two models' weights
+in decoder layers 40-63, factored into pairs of rank-256 matrices and rounded to bf16. No other
+change was made to it.
+
+This repository does not contain Cloudflare's joint_schema_model.py. The decision service and the
+evaluation scripts load it, unchanged, from a downloaded copy of the Clef release.
+
+eval/build_records.py downloads rows of two public datasets, which are not stored here:
+ARC-Challenge (allenai/ai2_arc, CC BY-SA 4.0) and BANKING77 (PolyAI, CC BY 4.0). The files in
+eval/reference/ hold record ids, option names, logits and probabilities computed on those rows,
+and none of their text.
