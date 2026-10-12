@@ -285,11 +285,71 @@ question with its options, and an 18-token ending. To be reused, a prompt should
 Asking the same questions about a new state each time, as a classifier does, reuses nothing,
 because the state comes before the questions.
 
+## The scoring network on the GPU
+
+With `CLEF_GPU_HEAD=1` in vLLM's environment and `--gpu-head` on the decision service, Clef's scoring
+network runs inside vLLM's process on the GPU, and the service only tokenizes requests and formats
+answers. Nothing is sent back to the service but the option scores.
+
+What happens for one decision:
+
+1. The service sends, with the token ids, where the questions and options lie in the prompt
+   (`vllm_xargs` `clef_head`, as JSON text: the first question position rounded down to 16, and each
+   question's type, span and option spans).
+2. Each time vLLM has computed a chunk of the prompt (at most 2,048 positions), the plugin turns the
+   chunk's hidden states into the twelve key and value rows per position (`head.memory_kv`). Rows of
+   positions before the first question go straight into a store of prompt starts on the GPU, in
+   NVFP4 (`gpu_store.py`, `packed.py`: 6,960 bytes per position instead of 49,152 in fp32); the rows
+   and hidden states of the question positions, a few hundred, are kept at full precision for this
+   request only.
+3. If vLLM served the start of the prompt from its cache, the plugin finds that start's rows in its
+   store by the chain of token-id hashes, as the CPU store does; if they are not there, it reports
+   "not kept" and the service asks again with a `cache_salt`, which makes vLLM read the whole prompt.
+4. When every position has been seen, the plugin runs the rest of the network (`head.forward`) over
+   the stored rows, unpacked one attention layer at a time, and the kept ones, and writes the scores
+   to `CAPTURE_DIR/KEY.json`.
+
+The store follows the CPU store's rules (one buffer per prompt start, a growing prompt extended in
+place with its last blocks rewritten, a departing one given its own buffer, least recently used
+dropped first), within `CLEF_GPU_STORE_MB` (default 512). The network itself is loaded from Clef's
+release directory, mounted into vLLM's container and named by `CLEF_RELEASE`, on the first decision.
+
+Storing the rows in NVFP4 was checked on real hidden states before it was built: on six prompts of
+16,100 to 70,800 tokens, where 98% of each prompt came from stored rows, it moved probabilities by
+at most 0.0003 and changed none of 18 answers (`eval/row_precision.py`); bf16 and FP8 moved nothing
+measurable. On the CPU, the plugin's scorer agrees with the service's CPU path given the same NVFP4
+rows to 2 × 10⁻⁵ (`vllm-plugin/test_gpu_head.py`).
+
+Measured on the RTX 5090 setup, with `CLEF_FULL_CACHE_HITS=1` in both cases:
+
+| Prompt | Read in full, scoring on the GPU | Read in full, on the CPU | Grown by four lines, GPU | Grown, CPU |
+|---:|---:|---:|---:|---:|
+| 1,015 tokens | 169–176 ms | about 219 ms | 165–183 ms | about 223 ms |
+| 4,002 tokens | 496 ms | 745 ms | 178 ms | 230 ms |
+| 8,019 tokens | 1,036 ms | 1,598 ms | 175–178 ms | 199 ms |
+| 16,002 tokens | 2,083–2,150 ms | 3,199 ms | 181–193 ms | 246 ms |
+| 32,013 tokens | 4,824–4,828 ms | 6,953 ms | 310–311 ms | 395 ms |
+
+The network's own share was 24–34 ms for a decision with a reused start and 26–108 ms for one read
+in full (108 ms at 32,000 tokens, against about 1.9 s on 8 CPU threads); the rest is vLLM. On the 72
+test records it got 84 of 85 known answers right, as the CPU path did on this server, with a median of
+166 ms per decision. On a 15,000-token game, reused decisions differed from full reads by at most
+0.158 in probability, against 0.162 between two full reads, and all twelve chose the same step.
+Fifteen decisions sent while a chat streamed took a median of 0.27 s, and the chat text was correct.
+
+Graphics memory: the network's weights take 256 MB (fp32), the store up to its budget, and its work
+during a decision some hundreds of MB more. On the measured card, which has about 200 MiB free, that
+came out of vLLM's key-value reservation, cut from 5 to 4 GiB: the longest request went from 194,000
+to 147,000 tokens, and the card's memory in use ended about 140 MiB above the configuration without
+the network, with no more memory moved to system RAM. Chat speed and speculative acceptance were
+unchanged (264 tokens/s and 64% on that start, within the ±10% that varies from one vLLM start to the
+next).
+
 ## Further speed-ups considered and not built
 
 These were examined on the RTX 5090 setup and left aside, because a cached decision there already
-takes about 0.2–0.25 s up to 16k tokens and about 0.5 s at 64k with `CLEF_FULL_CACHE_HITS=1`. They
-are recorded with what was measured and what is only estimated.
+takes about 0.2 s up to 16k tokens and about 0.3 s at 32k with `CLEF_FULL_CACHE_HITS=1` and the
+scoring network on the GPU. They are recorded with what was measured and what is only estimated.
 
 ### Resuming inside a 1,552-token page
 
@@ -322,19 +382,3 @@ and 0.57 s. Three ways to resume closer to where the next prompt departs:
   instead of NVFP4 a page holds about 800 tokens instead of 1,552, halving the re-read, but the
   same 5 GiB holds about 100,000 tokens instead of 194,648, so a cached start survives about half
   as much other traffic. Untested.
-
-### The scoring network on the GPU
-
-On a 64,000-token prompt read in full, the scoring network takes about 3.2 s on 8 CPU threads, 90%
-of it in one step: projecting every position to its twelve key and value rows (2.97 s; 20 threads
-cut it only to 2.74 s). That step is about 2.3 trillion multiply-adds, tens of milliseconds on the
-GPU. A separate GPU process would not fit on the measured card (its own CUDA context alone is
-300–500 MB, with about 200 MiB free), but the capture plugin could compute the rows inside vLLM,
-one chunk of at most 2,048 positions at a time, for about 75 MB of graphics memory. Estimated
-effect: a 64k decision read in full from about 17 s to about 14 s; for a cached decision, which
-computes rows only for its new positions, about 0.17 s at 64k. Keeping the stored rows on the GPU
-as well would also remove the CPU attention (about 0.13 s at 64k); there, NVFP4 storage would make a
-64k prompt's rows about 0.4 GB instead of 1.6 GB in bf16. On the 72 test records, rounding the stored
-rows to NVFP4 and back changed probabilities by at most 0.0005 (FP8: 0.0001, bf16: under 0.0001) and
-no answer, while rounding the scoring network's own weights to NVFP4 changed them by up to 0.0054;
-these records are short, so long prompts would need checking.

@@ -55,13 +55,33 @@ def capture_key(sampling_params) -> str | None:
     return key
 
 
+def head_spec(sampling_params) -> dict | None:
+    """The question and option positions a request sends for scoring on the GPU (gpu_head.py). vLLM's
+    API takes only strings, numbers and flat lists in vllm_xargs, so the service sends it as JSON text."""
+    extra = getattr(sampling_params, "extra_args", None) or {}
+    return parse_spec(extra.get("clef_head") if isinstance(extra, dict) else None)
+
+
+def parse_spec(spec) -> dict | None:
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except ValueError:
+            return None
+    return spec if isinstance(spec, dict) else None
+
+
 class Capture:
-    """Per-request host buffers, living in the model runner's process."""
+    """Per-request host buffers, living in the model runner's process. A request that carries a
+    scoring spec (head_spec) goes to the GPU scorer instead, when $CLEF_GPU_HEAD=1."""
 
     def __init__(self, directory: str) -> None:
         self.directory = directory
         self._ensure_directory()
         self.buffers: dict[str, dict] = {}
+        from .gpu_head import scorer_from_environment
+
+        self.scorer = scorer_from_environment(directory)
 
     def _ensure_directory(self) -> None:
         # The directory is in the host's /dev/shm, which is empty after WSL restarts. Whichever
@@ -74,7 +94,14 @@ class Capture:
             except PermissionError:
                 pass
 
-    def add(self, req_id: str, key: str, prompt_ids, start: int, rows) -> None:
+    def add(self, req_id: str, key: str, prompt_ids, start: int, rows, spec: dict | None = None) -> None:
+        spec = parse_spec(spec)
+        if spec is not None:
+            if self.scorer is not None:
+                self.scorer.add(req_id, key, prompt_ids, spec, start, rows)
+            else:
+                self.fail(req_id, key, "the scoring network is not enabled in vLLM (CLEF_GPU_HEAD=1, CLEF_RELEASE)")
+            return
         import numpy as np
         import torch
 
@@ -111,6 +138,8 @@ class Capture:
             entry["done"] = True
 
     def drop(self, req_ids) -> None:
+        if self.scorer is not None:
+            self.scorer.drop(req_ids)
         for req_id in req_ids:
             self.buffers.pop(req_id, None)
 
@@ -209,7 +238,7 @@ def _capture_v1(runner, model_output) -> None:
         key = capture_key(getattr(state, "sampling_params", None)) if state is not None else None
         if key:
             marked.append((req_id, key, state.prompt_token_ids or [], int(batch.num_computed_tokens_cpu[index]),
-                           offset, count))
+                           offset, count, head_spec(state.sampling_params)))
         offset += count
     if not marked:
         return
@@ -217,10 +246,10 @@ def _capture_v1(runner, model_output) -> None:
     if hidden is None:
         return
     _synchronize(hidden)
-    for req_id, key, prompt_ids, start, offset, count in marked:
+    for req_id, key, prompt_ids, start, offset, count, spec in marked:
         take = max(0, min(count, len(prompt_ids) - start))
         if take:
-            runner._clef_capture.add(req_id, key, prompt_ids, start, hidden[offset:offset + take])
+            runner._clef_capture.add(req_id, key, prompt_ids, start, hidden[offset:offset + take], spec)
 
 
 def _patch_v2() -> None:
@@ -238,7 +267,7 @@ def _patch_v2() -> None:
         for new in scheduler_output.scheduled_new_reqs:
             key = capture_key(getattr(new, "sampling_params", None))
             if key:
-                marked[new.req_id] = (key, list(new.prompt_token_ids or []))
+                marked[new.req_id] = (key, list(new.prompt_token_ids or []), head_spec(new.sampling_params))
         return original_add(self, scheduler_output)
 
     def execute_model(self, scheduler_output, *args, **kwargs):
@@ -271,9 +300,10 @@ def _capture_v2(runner) -> None:
     work = []
     for index, req_id in enumerate(batch.req_ids[:batch.num_reqs]):
         if req_id in marked:
-            key, prompt_ids = marked[req_id]
+            key, prompt_ids, *rest = marked[req_id]
             work.append((req_id, key, prompt_ids, int(batch.num_computed_tokens_np[index]),
-                         int(batch.query_start_loc_np[index]), int(batch.num_scheduled_tokens[index])))
+                         int(batch.query_start_loc_np[index]), int(batch.num_scheduled_tokens[index]),
+                         rest[0] if rest else None))
     if not work:
         return
     if getattr(runner, "adaptive_verification", None) is not None:
@@ -286,10 +316,10 @@ def _capture_v2(runner) -> None:
     if hidden is None:
         return
     _synchronize(hidden)
-    for req_id, key, prompt_ids, start, offset, count in work:
+    for req_id, key, prompt_ids, start, offset, count, spec in work:
         take = max(0, min(count, len(prompt_ids) - start))
         if take:
-            runner._clef_capture.add(req_id, key, prompt_ids, start, hidden[offset:offset + take])
+            runner._clef_capture.add(req_id, key, prompt_ids, start, hidden[offset:offset + take], spec)
 
 
 LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")

@@ -73,6 +73,11 @@ class RequestError(Exception):
     """A problem with the caller's request: answered with 400."""
 
 
+class NotKept(Exception):
+    """vLLM served the start of the prompt from its cache, and its rows are not kept where scoring
+    happens; the prompt has to be read again in full."""
+
+
 class BackboneError(Exception):
     """vLLM or the capture failed: answered with 502, or 504 for a timeout."""
 
@@ -93,9 +98,35 @@ class VllmBackbone:
         reuse_limit, when set, asks the clef_capture plugin not to reuse cached positions beyond it
         (honoured when vLLM runs with CLEF_FULL_CACHE_HITS=1; otherwise vLLM's own held-back blocks
         keep the reuse further back)."""
+        started = time.perf_counter()
+        key, path = self._request(token_ids, reuse_cache, reuse_limit, ".bin")
+        try:
+            header, hidden = capture_file.read(path, token_ids)
+        finally:
+            os.remove(path)
+        return header["first_position"], hidden, {"backbone_seconds": round(time.perf_counter() - started, 4)}
+
+    def scores(self, token_ids: list[int], spec: dict, reuse_cache: bool, reuse_limit: int = 0) -> tuple[int, list, dict]:
+        """(first computed position, option logits per question, timings), with the scoring network run
+        inside vLLM on the GPU (the plugin's CLEF_GPU_HEAD=1). spec says where the questions and
+        options lie; raises NotKept when the rows of the positions vLLM skipped are not in the plugin's
+        store."""
+        started = time.perf_counter()
+        _, path = self._request(token_ids, reuse_cache, reuse_limit, ".json", {"clef_head": json.dumps(spec)})
+        try:
+            result = json.loads(Path(path).read_text())
+        finally:
+            os.remove(path)
+        timings = {"backbone_seconds": round(time.perf_counter() - started, 4),
+                   "gpu_scoring_seconds": result.get("scoring_seconds")}
+        return result["first_position"], result["logits"], timings
+
+    def _request(self, token_ids: list[int], reuse_cache: bool, reuse_limit: int, suffix: str,
+                 extra: dict | None = None) -> tuple[str, str]:
+        """Send one decision request and wait for the plugin's file KEY+suffix; returns (key, path)."""
         key = "clef-" + uuid.uuid4().hex
         payload = {"model": self.adapter, "prompt": token_ids, "max_tokens": 1, "temperature": 0.0,
-                   "vllm_xargs": {"clef_capture": key}}
+                   "vllm_xargs": {"clef_capture": key, **(extra or {})}}
         if not reuse_cache:
             payload["cache_salt"] = key
         elif reuse_limit:
@@ -103,7 +134,6 @@ class VllmBackbone:
         body = json.dumps(payload).encode()
         request = urllib.request.Request(self.url + "/v1/completions", data=body,
                                          headers={"Content-Type": "application/json"})
-        started = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 reply = json.loads(response.read())
@@ -114,23 +144,21 @@ class VllmBackbone:
         prompt_tokens = (reply.get("usage") or {}).get("prompt_tokens")
         if prompt_tokens != len(token_ids):
             raise BackboneError(f"vLLM read {prompt_tokens} prompt tokens, {len(token_ids)} were sent")
-        path = os.path.join(self.capture_dir, key + ".bin")
+        path = os.path.join(self.capture_dir, key + suffix)
         error_path = os.path.join(self.capture_dir, key + ".err")
         deadline = time.monotonic() + 10.0
         while not os.path.exists(path):
             if os.path.exists(error_path):
                 message = Path(error_path).read_text()
                 os.remove(error_path)
-                raise BackboneError(f"hidden states were not captured: {message}")
+                if message.startswith("not kept"):
+                    raise NotKept(message)
+                raise BackboneError(f"the plugin reported: {message}")
             if time.monotonic() > deadline:
-                raise BackboneError("vLLM answered but wrote no hidden states; is the clef_capture "
-                                    "plugin installed and CAPTURE_DIR shared with the container?", 504)
-            time.sleep(0.005)
-        try:
-            header, hidden = capture_file.read(path, token_ids)
-        finally:
-            os.remove(path)
-        return header["first_position"], hidden, {"backbone_seconds": round(time.perf_counter() - started, 4)}
+                raise BackboneError("vLLM answered but the clef_capture plugin wrote nothing; is it installed "
+                                    "and CAPTURE_DIR shared with the container?", 504)
+            time.sleep(0.002)
+        return key, path
 
     def prime(self, token_ids: list[int]) -> None:
         """Send the start of a decision prompt with nothing captured, so that vLLM saves a reusable
@@ -197,17 +225,19 @@ class ReferenceBackbone:
 
 class Decider:
     def __init__(self, release: str, backbone, max_length: int, store: reuse.PrefixStore | None,
-                 prime_margin: int = 0, prime_unit: int = 16) -> None:
+                 prime_margin: int = 0, prime_unit: int = 16, gpu_head: bool = False) -> None:
         from transformers import AutoTokenizer
         from safetensors.torch import load_file
 
         release_path = Path(release)
         self.tokenizer = AutoTokenizer.from_pretrained(release_path)
-        head_config = json.loads((release_path / "joint_head_config.json").read_text())
-        self.head = JointSchemaHead(**head_config)
-        self.head.load_state_dict(load_file(release_path / "joint_head.safetensors"), strict=True)
-        self.head = self.head.float().eval()
-        self.rows = OutputEmbeddingRows(release_path).as_tensor_lookup(torch.float32)
+        self.gpu_head = gpu_head
+        if not gpu_head:  # with the scoring network in vLLM, the service needs only the tokenizer
+            head_config = json.loads((release_path / "joint_head_config.json").read_text())
+            self.head = JointSchemaHead(**head_config)
+            self.head.load_state_dict(load_file(release_path / "joint_head.safetensors"), strict=True)
+            self.head = self.head.float().eval()
+            self.rows = OutputEmbeddingRows(release_path).as_tensor_lookup(torch.float32)
         self.backbone = backbone
         self.max_length = max_length
         self.store = store
@@ -251,6 +281,8 @@ class Decider:
             raise RequestError(f"the prompt is {len(token_ids)} tokens and the limit is {self.max_length}; "
                                "shorten the state")
         needed = reuse.first_needed_position(encoded)
+        if self.gpu_head:
+            return self._decide_on_gpu(request, encoded, token_ids, needed, started)
         first, hidden, timings = self.backbone.hidden_states(token_ids, reuse_cache=self.store is not None,
                                                              reuse_limit=needed)
         logits = None
@@ -285,12 +317,7 @@ class Decider:
                 timings["backbone_seconds"] = round(timings["backbone_seconds"] + again["backbone_seconds"], 4)
                 timings["read_twice"] = True
         timings["reused_tokens"] = first
-        questions = request["questions"]
-        answers = {
-            q.question_id: systemone_answer(
-                questions[q.question_id], dict(zip(q.option_ids, ql.float().softmax(-1).tolist())))
-            for q, ql in zip(encoded.questions, logits)
-        }
+        answers = _answers(request, encoded, logits)
         timings["head_seconds"] = round(time.perf_counter() - head_started, 4)
         timings["total_seconds"] = round(time.perf_counter() - started, 4)
         return {
@@ -298,6 +325,33 @@ class Decider:
             "usage": {"input_tokens": len(token_ids), "output_tokens": 0},
             "timings": timings,
         }
+
+    def _decide_on_gpu(self, request: dict, encoded, token_ids: list[int], needed: int, started: float) -> dict:
+        """The scoring network runs inside vLLM (the plugin's CLEF_GPU_HEAD=1); this sends where the
+        questions and options lie and turns the returned scores into answers."""
+        spec = {"cut": needed // 16 * 16,
+                "questions": [{"type": int(q.question_type), "span": list(q.question_span),
+                               "options": [list(span) for span in q.option_spans]} for q in encoded.questions]}
+        try:
+            first, logits, timings = self.backbone.scores(token_ids, spec, reuse_cache=True, reuse_limit=needed)
+        except NotKept:
+            log.info("vLLM reused positions whose rows are not kept in the plugin; reading the prompt again in full")
+            first, logits, timings = self.backbone.scores(token_ids, spec, reuse_cache=False)
+            timings["read_twice"] = True
+        timings["reused_tokens"] = first
+        timings["head_seconds"] = timings.get("gpu_scoring_seconds") or 0.0  # scored inside vLLM, within backbone_seconds
+        timings["total_seconds"] = round(time.perf_counter() - started, 4)
+        return {"model": request["model"], "answers": _answers(request, encoded, logits),
+                "usage": {"input_tokens": len(token_ids), "output_tokens": 0}, "timings": timings}
+
+
+def _answers(request: dict, encoded, logits) -> dict:
+    questions = request["questions"]
+    return {
+        q.question_id: systemone_answer(
+            questions[q.question_id], dict(zip(q.option_ids, torch.as_tensor(ql).float().softmax(-1).tolist())))
+        for q, ql in zip(encoded.questions, logits)
+    }
 
 
 def make_handler(decider: Decider, backbone_name: str):
@@ -390,6 +444,9 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=16384)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--gpu-head", action="store_true",
+                        help="the scoring network runs inside vLLM on the GPU (the plugin's CLEF_GPU_HEAD=1); "
+                             "the service only tokenizes and formats answers")
     parser.add_argument("--prime-margin", type=int, default=0,
                         help="after each decision, prime vLLM's cache with the prompt up to this many tokens before "
                              "its first question (0: off); needs vLLM's --prefix-match-unit to pay off, which the "
@@ -405,12 +462,16 @@ def main() -> None:
         backbone, name = ReferenceBackbone(args.reference_dir), "reference"
     else:
         backbone, name = VllmBackbone(args.vllm, args.adapter, args.capture_dir, args.timeout), "vllm"
-    store = reuse.PrefixStore(args.reuse_memory_mb * 2**20) if args.reuse_memory_mb > 0 else None
-    decider = Decider(str(clef_code.release_dir()), backbone, args.max_length, store, args.prime_margin, args.prime_unit)
+    store = reuse.PrefixStore(args.reuse_memory_mb * 2**20) if args.reuse_memory_mb > 0 and not args.gpu_head else None
+    decider = Decider(str(clef_code.release_dir()), backbone, args.max_length, store, args.prime_margin, args.prime_unit,
+                      gpu_head=args.gpu_head)
     host, port = args.listen.rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), make_handler(decider, name))
-    log.info("listening on %s, hidden states from %s, %s", args.listen, name,
-             f"keeping up to {args.reuse_memory_mb} MB of prompt starts" if store else "every prompt read in full")
+    if args.gpu_head:
+        mode = "scoring network and kept prompt starts inside vLLM on the GPU"
+    else:
+        mode = f"keeping up to {args.reuse_memory_mb} MB of prompt starts" if store else "every prompt read in full"
+    log.info("listening on %s, hidden states from %s, %s", args.listen, name, mode)
     server.serve_forever()
 
 

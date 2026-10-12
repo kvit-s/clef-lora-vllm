@@ -20,6 +20,9 @@ export CLEF_LORA_LAYERS=40-63
 # With a speculative draft model: let decisions reuse every whole cached block (tested on the
 # DFlash2 fork of vLLM 0.27.2 only; see docs/how-it-works.md#how-much-vllm-reuses).
 # export CLEF_FULL_CACHE_HITS=1
+# Score decisions on the GPU inside vLLM (the decision service then runs with --gpu-head); needs
+# Clef's release files (service/fetch_release.py) and about 1 GB of graphics memory.
+# export CLEF_GPU_HEAD=1 CLEF_RELEASE=/path/to/clef-release CLEF_GPU_STORE_MB=512
 
 exec vllm serve "$MODEL" \
     --served-model-name qwen3.8-27b \

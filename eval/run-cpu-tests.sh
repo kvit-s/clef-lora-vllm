@@ -57,4 +57,19 @@ $PYTHON -I "$ROOT/service/service.py" --release "$RELEASE" --vllm http://127.0.0
 wait_up http://127.0.0.1:18299 && wait_up http://127.0.0.1:18291 && wait_up http://127.0.0.1:18292
 $PYTHON -I "$ROOT/eval/game_test.py" http://127.0.0.1:18291 http://127.0.0.1:18292 --release "$RELEASE" \
     --corpus-tokens 4000 --decisions 6 --block 256 --match-unit 16 --prime-margin 64
+echo "=== 5. the scoring network inside the plugin (run here on the CPU), stored rows in NVFP4"
+$PYTHON -I "$ROOT/vllm-plugin/test_gpu_head.py" --release "$RELEASE" ${HIDDEN:+--reference-hidden "$HIDDEN"}
+$PYTHON -I "$ROOT/service/mock_vllm.py" "$WORK/capture3" --listen 127.0.0.1:18399 --block 256 --release "$RELEASE" \
+    ${HIDDEN:+--reference-hidden "$HIDDEN"} > "$WORK/mock3.log" 2>&1 & PIDS+=($!)
+$PYTHON -I "$ROOT/service/service.py" --release "$RELEASE" --vllm http://127.0.0.1:18399 \
+    --capture-dir "$WORK/capture3" --listen 127.0.0.1:18391 --gpu-head > "$WORK/gpu.log" 2>&1 & PIDS+=($!)
+$PYTHON -I "$ROOT/service/service.py" --release "$RELEASE" --vllm http://127.0.0.1:18399 \
+    --capture-dir "$WORK/capture3" --listen 127.0.0.1:18392 --reuse-memory-mb 0 > "$WORK/full3.log" 2>&1 & PIDS+=($!)
+wait_up http://127.0.0.1:18399 && wait_up http://127.0.0.1:18391 && wait_up http://127.0.0.1:18392
+$PYTHON -I "$ROOT/eval/game_test.py" http://127.0.0.1:18391 http://127.0.0.1:18392 --release "$RELEASE" \
+    --corpus-tokens 4000 --decisions 6 --block 256 --held-back-blocks 0 --tolerance 0.01
+if [ -n "$HIDDEN" ]; then
+    echo "--- the 72 records against the reference answers, scored by the plugin"
+    $PYTHON -I "$ROOT/eval/test_service.py" http://127.0.0.1:18391
+fi
 echo "all CPU tests passed"

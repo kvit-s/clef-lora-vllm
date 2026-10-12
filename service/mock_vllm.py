@@ -13,7 +13,8 @@ It answers the three things the service and the test scripts use:
   chain of token ids up to it and by the request's cache_salt. A new prompt resumes from the furthest
   point it shares with an earlier one (at most its length minus one, and at most vllm_xargs
   clef_reuse_limit), and only the positions from there on are written. Requests with vllm_xargs
-  clef_prime only register their points;
+  clef_prime only register their points. A request with vllm_xargs clef_head is scored by the plugin's
+  GPU scorer (gpu_head.py), run here on the CPU, which needs --release;
 - POST /v1/chat/completions, streamed or not: a fixed answer, with usage, for speed_probe.py;
 - GET /health.
 
@@ -47,12 +48,18 @@ def main():
     parser.add_argument("--block", type=int, default=1552,
                         help="prefix-cache block size; vLLM uses 1,552 for Qwen3.8-27B")
     parser.add_argument("--match-unit", type=int, default=0, help="like vLLM's --prefix-match-unit (0: the block size)")
+    parser.add_argument("--release", help="Clef's release directory, to score clef_head requests as the plugin does")
+    parser.add_argument("--gpu-store-mb", type=int, default=512)
     args = parser.parse_args()
     by_digest = {}
     for npz in (Path(args.reference_hidden).glob("*.npz") if args.reference_hidden else []):
         with np.load(npz) as data:
             by_digest[capture_file.token_ids_digest(data["input_ids"])] = npz
     capture = clef_capture.Capture(args.capture_dir)
+    if args.release:
+        from clef_capture.gpu_head import GpuScorer
+
+        capture.scorer = GpuScorer(args.release, args.gpu_store_mb * 2**20, args.capture_dir)
     unit = args.match_unit or args.block
     assert args.block % unit == 0, "the block size must be a multiple of --match-unit"
     points = set()  # names of the points a later prompt can resume from
@@ -110,7 +117,8 @@ def main():
                     else:
                         hidden = made_up_hidden(ids, first)
                     for start in range(first, len(ids), 2048):
-                        capture.add(key, key, ids, start, hidden[start - first:start - first + 2048])
+                        capture.add(key, key, ids, start, hidden[start - first:start - first + 2048],
+                                    xargs.get("clef_head"))
                     capture.drop([key])
                 return self._json(200, {"choices": [{"text": "x"}], "usage": {"prompt_tokens": len(ids)}})
             if self.path == "/v1/chat/completions":

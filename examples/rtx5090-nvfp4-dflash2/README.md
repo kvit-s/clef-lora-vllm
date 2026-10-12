@@ -114,6 +114,17 @@ boundary; docs/how-it-works.md), the same sweep gave (`sweep-full-cache-hits.jso
 | 32,101 | 395 ms | 387 ms | 31,040 |
 | 64,102 | 478 ms | 413 ms | 63,632 |
 
+With the scoring network on the GPU as well (`CLEF_GPU_HEAD=1`, `CLEF_RELEASE` mounted,
+`CLEF_GPU_STORE_MB=400`, the key-value reservation cut from 5 to 4 GiB and the longest request to
+147,000 tokens; the service with `--gpu-head`), on 2026-10-12 (`sweep-gpu-scoring.jsonl`):
+
+| Prompt | Read in full | Grown by four lines | Identical again | The network's share |
+|---:|---:|---:|---:|---:|
+| 1,015 | 169–176 ms | 165–183 ms | 164–166 ms | 25–26 ms |
+| 8,019 | 1,036 ms | 175–178 ms | 179–182 ms | 24–47 ms |
+| 16,002 | 2,083–2,150 ms | 181–193 ms | 188–196 ms | 24–63 ms |
+| 32,013 | 4,824–4,828 ms | 310–311 ms | 288–295 ms | 34–108 ms |
+
 Nothing is reused below about 4,700 tokens, because vLLM reuses whole 1,552-token blocks and
 holds back the last two. Read in full, a 64,000-token decision spent 12.8 s in vLLM (about 5,000
 tokens/s) and 3.7 s in the scoring network on the CPU. At 2,000 tokens the grown request was
