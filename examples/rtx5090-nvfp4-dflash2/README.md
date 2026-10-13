@@ -20,168 +20,108 @@ the model.
   driver moves part of the model's memory to system RAM and decode falls to 20–60 tokens/s, so
   anything added has to come out of an existing reservation.
 
-## What the adapter changed
+## What the overlay changes
 
-`compose.clef.yaml` in this directory is an overlay for the DFlash2 project's own compose file.
-The adapter's buffers (1.4 GB plus vLLM's bookkeeping) came out of the key-value reservation,
-which went from 6.5 to 5 GiB: vLLM fits 194,648 token slots in it, and the longest request is
-194,000 tokens. Measured on 2026-10-07:
+`compose.clef.yaml` in this directory is an overlay for the DFlash2 project's own compose file;
+its comments say how to build the image and start it. It also needs
+`MAX_NUM_BATCHED_TOKENS=2048` in the project's `.env`: with the project's 4,096-token steps, two
+long prompts read at once leave vLLM holding 600–880 MB more memory than before, which the full
+card does not have, and Windows then moves part of vLLM's memory into system RAM until vLLM
+restarts.
 
-| | Without the adapter | With the adapter |
+Decisions need two things on the card: the adapter's buffers, 1.4 GB in bf16 plus vLLM's
+bookkeeping, and the scoring network with its working memory, about 490 MiB. Both come out of the
+key-value reservation, which is 4.75 GiB instead of 6.5. vLLM fits 182,279 token slots in it, so the
+longest request is 181,000 tokens instead of 262,144, and six short requests fit at once instead of
+eight. Measured on 2026-10-12:
+
+| | Without the adapter | With the adapter and the scoring network |
 |---|---|---|
-| card memory in use (`nvidia-smi`) | 30,936–31,303 MiB | 31,293 MiB |
-| card memory Windows holds in system RAM | 333–570 MB | 2,826 MB |
-| chat decode, one conversation | 243 tokens/s | 206 tokens/s |
-| prompt reading, 10,000 tokens | 10,072 tokens/s | 9,600 tokens/s |
-| longest request | 262,144 tokens | 194,000 tokens |
+| card memory in use (`nvidia-smi`) | 30,936–31,303 MiB | 31,690 MiB |
+| card memory Windows holds in system RAM | 333–570 MB | 2,959 MB |
+| PCIe traffic to the card during a chat | | median 41 MB/s, at most 121 MB/s |
 
-Decode is 15% slower with the adapter loaded, whether or not decisions are being made. PCIe
-traffic during a chat with the adapter loaded was 30–46 MB/s, against about 8,000 MB/s when the
-card was paging to system RAM, so the loss comes from vLLM's LoRA support itself rather than from
-memory moved off the card.
+The extra memory Windows holds is not read back during chat: PCIe traffic stays at the level of
+the idle desktop, against about 8,000 MB/s when the card pages.
+
+Whether the adapter slows chat could not be measured, because chat speed on this server varies
+between vLLM starts by more than any difference it might cause. The draft model's acceptance rate
+on a fixed test prompt is the same on every run within one start and differs from one start to
+the next, and decode speed follows it:
+
+| Draft tokens accepted | Decode, tokens/s, with the adapter |
+|---|---|
+| 51% | 214–236 |
+| 54–57% | 205–235 |
+| 62–67% | 253–264 |
+
+One start without the adapter decoded the same prompt at 243 tokens/s, inside that range.
+
+Several chats at once, with the DFlash2 project's concurrency benchmark (five essay prompts of 512
+tokens at temperature 0, on which about 30% of draft tokens are accepted):
+
+| Streams | Total, tokens/s | Before the adapter |
+|---:|---:|---:|
+| 1 | 141–149 | 125 |
+| 2 | 277–298 | 244 |
+| 4 | 507–567 | 456–470 |
+| 8 requested, 6 running | 568–581 | 801, all eight running |
 
 ## Decisions
 
-The 72 test records (`eval/`), with the full-precision CPU run of Clef as the reference:
+The 72 test records (`eval/`), with Clef in bf16 on the CPU as the reference, gave 85 of the 85
+known answers right, against 83 for the reference, and 85 of 87 answers agreed with the reference.
+Answers close to an even split can flip between runs; other runs scored 83 and 84. The last
+layer's output, compared with the reference over the first 16 ARC records (`compare-hidden.json`),
+had a relative error of 0.38–0.45 and a mean cosine similarity per position of 0.906–0.932 with the
+adapter, against 1.10–1.19 and 0.34–0.42 without it; the remaining distance comes from the 4-bit
+checkpoint and cache rather than from the adapter.
 
-| | Known answers right | Answers agreeing with the reference |
-|---|---|---|
-| Clef at bf16 on the CPU (the reference) | 83 of 85 | — |
-| this setup | 84 of 85 | 84 of 87 |
+Over the 72 records the median decision took 165 ms and the longest 421 ms. A one-token
+completion without the adapter takes 123 ms for a 217-token prompt on the same server, so most of
+a short decision's time is vLLM's fixed cost per request.
 
-The largest difference in any option's probability was 0.53. Two later runs scored 83 and 85 of
-85; the answers that moved between runs were close calls such as one whose probability sits at
-about 0.5. The last layer's output, compared with the reference over the first 16 ARC records
-(`compare-hidden.json`), had a relative error of 0.38–0.45 and a mean cosine similarity per
-position of 0.906–0.932 with the adapter, against 1.10–1.19 and 0.34–0.42 without it; the
-remaining distance comes from the 4-bit checkpoint and cache rather than from the adapter.
+## Latency by prompt length
 
-| Prompt length | Requests | vLLM | Scoring network | Total (median) |
-|---|---|---|---|---|
-| under 300 tokens (median 217) | 41 | 154 ms | 40 ms | 197 ms |
-| 300–700 tokens (median 445) | 7 | 167 ms | 53 ms | 219 ms |
-| BANKING77, median 1,836 tokens | 24 | 203 ms | 128 ms | 336 ms |
-
-Over all 72 the median was 212 ms. A one-token completion without the adapter took 123 ms for
-217 tokens on the same server, so most of a short decision's time is vLLM's fixed cost per
-request; the adapter and the capture add about 30 ms. Ten decisions sent while a 600-token chat
-streamed took a median of 267 ms.
-
-## Latency by prompt length, and against Jev
-
-Measured on 2026-10-11 with `eval/latency_sweep.py`: one 6-option choice question about a
-support transcript of growing length, sent from the same machine. For this run the service
-allowed prompts of up to 65,536 tokens (`--max-length 65536`) and kept 4 GB of prompt starts.
-Each cell is the median time at the client over five requests (two at 32,000 and 64,000 tokens):
+One 6-option choice question about a support transcript of growing length, sent from the same
+machine with `eval/latency_sweep.py` and the service at `--max-length 32768`:
 
 | Prompt tokens | Read in full | The identical request again | Transcript grown by four lines | Tokens reused |
 |---:|---:|---:|---:|---:|
-| 310 | 177 ms | 156 ms | 173 ms | 0 |
-| 739 | 208 ms | 209 ms | 204 ms | 0 |
-| 1,015 | 219 ms | 208 ms | 223 ms | 0 |
-| 2,022 | 351 ms | 359 ms | 455 ms | 0 |
-| 4,002 | 744 ms | 716 ms | 731 ms | 0 |
-| 8,019 | 1,432 ms | 677 ms | 686 ms | 4,656 |
-| 16,002 | 3,036 ms | 892 ms | 953 ms | 12,416 |
-| 32,013 | 7,036 ms | 1,438 ms | 1,466 ms | 27,936 |
-| 64,015 | 16,588 ms | 2,171 ms | 2,142 ms | 60,528 |
+| 310 | 137 ms | 141 ms | 147 ms | 0 |
+| 739 | 146 ms | 140 ms | 143 ms | 0 |
+| 1,015 | 151 ms | 141 ms | 147 ms | 0 |
+| 2,022 | 330 ms | 144 ms | 148 ms | 1,552 |
+| 4,002 | 475 ms | 142 ms | 145 ms | 3,104 |
+| 8,019 | 1,032 ms | 152 ms | 157 ms | 7,760 |
+| 16,002 | 2,054 ms | 179 ms | 180 ms | 15,520 |
+| 32,013 | 4,926 ms | 308 ms | 311 ms | 31,040 |
 
-The table was measured with the first version of the decision service's store of reused rows.
-The current version keeps each prompt start's rows in one buffer instead of many small blocks
-(see docs/how-it-works.md). Run back to back on the same server on 2026-10-11, the old version
-before and after the new one, so that drift of the machine shows up as a difference between the
-two old runs (medians of three requests, two at 32,000 and 64,000 tokens; `store-comparison.jsonl`):
+Clef's accuracy beyond 16,384 tokens, the default limit of Cloudflare's released code, has not
+been tested.
 
-| Prompt | Request | Old store (two runs) | Current store |
-|---:|---|---:|---:|
-| 16,002 | identical again | 989 / 977 ms | 797 ms |
-| 16,089 | grown by four lines | 1,032 / 1,009 ms | 908 ms |
-| 32,013 | identical again | 1,584 / 1,426 ms | 1,180 ms |
-| 32,101 | grown by four lines | 1,576 / 1,506 ms | 1,209 ms |
-| 64,015 | identical again | 2,532 / 2,112 ms | 1,467 ms |
-| 64,102 | grown by four lines | 2,301 / 2,042 ms | 1,456 ms |
-| 64,015 | read in full | 17,992 / 17,388 ms | 17,166 ms |
-
-With `CLEF_FULL_CACHE_HITS=1` added to vLLM's environment in `compose.clef.yaml` (the plugin then
-skips vLLM's held-back blocks for decisions and saves the state at a decision prompt's last block
-boundary; docs/how-it-works.md), the same sweep gave (`sweep-full-cache-hits.jsonl`):
-
-| Prompt | Grown by four lines | Identical again | Reused |
-|---:|---:|---:|---:|
-| 4,089 | 230 ms | 223 ms | 3,104 |
-| 8,106 | 199 ms | 195 ms | 7,760 |
-| 16,089 | 246 ms | 217 ms | 15,520 |
-| 32,101 | 395 ms | 387 ms | 31,040 |
-| 64,102 | 478 ms | 413 ms | 63,632 |
-
-With the scoring network on the GPU as well (`CLEF_GPU_HEAD=1`, `CLEF_RELEASE` mounted,
-`CLEF_GPU_STORE_MB=400`, the key-value reservation cut from 5 to 4 GiB and the longest request to
-147,000 tokens; the service with `--gpu-head`), on 2026-10-12 (`sweep-gpu-scoring.jsonl`):
-
-| Prompt | Read in full | Grown by four lines | Identical again | The network's share |
-|---:|---:|---:|---:|---:|
-| 1,015 | 169–176 ms | 165–183 ms | 164–166 ms | 25–26 ms |
-| 8,019 | 1,036 ms | 175–178 ms | 179–182 ms | 24–47 ms |
-| 16,002 | 2,083–2,150 ms | 181–193 ms | 188–196 ms | 24–63 ms |
-| 32,013 | 4,824–4,828 ms | 310–311 ms | 288–295 ms | 34–108 ms |
-
-Nothing is reused below about 4,700 tokens, because vLLM reuses whole 1,552-token blocks and
-holds back the last two. Read in full, a 64,000-token decision spent 12.8 s in vLLM (about 5,000
-tokens/s) and 3.7 s in the scoring network on the CPU. At 2,000 tokens the grown request was
-about 100 ms slower than reading in full in all five tries, all of it in vLLM; it reuses nothing,
-and the cause has not been investigated. The same sizes sent through the house's front door on
-another machine took 1–41 ms longer at the median. The raw measurements are in `latency-sweep.jsonl`.
-
-Prompts of 32,000 and 64,000 tokens ran without error, but Clef's accuracy beyond 16,384 tokens,
-the default limit of Cloudflare's released code, has not been tested. Cloudflare describes Clef as
-having a 64k context window, and its hosted Clef accepts 65,536 tokens.
-
-**Published figures for Jev.** TypeSafe publishes no latency figures for Jev 1.13 and does not
-document prompt caching either way. Its limits are 64k tokens per request and 32k for the state
-plus the longest question. Two independent measurements exist:
-
-- The [jev-laya benchmark](https://github.com/harrymunro/jev-laya-benchmark) (2026-09-21) timed
-  the same kind of request, a 6-option choice about a support transcript, from a Mac whose round
-  trip to the API was about 50 ms. It sent each state 20 times after three warm-up requests and
-  reports the median.
-- Cloudflare's [decision model leaderboard](https://clef-evals.workers-ai-mle.workers.dev), from
-  the Decision Index's latency-v1 sample of 750 rows sent one at a time, gives Jev a median of
-  524 ms and a p95 of 536 ms over HTTPS from Cloudflare's lab, and Clef, as reported by Cloudflare
-  itself, 209 ms and 239 ms.
-
-Side by side with the first, at the nearest prompt lengths (token counts come from different
-tokenizers, and Jev's include its own question template):
-
-| Prompt tokens, Jev / here | Jev p50, including about 50 ms of network | Here, read in full | Here, with the start reused |
-|---|---:|---:|---:|
-| 533 / 310 | 138 ms | 177 ms | too short to reuse |
-| 670 / 739 | 188 ms | 208 ms | too short to reuse |
-| 1,258 / 1,015 | 148 ms | 219 ms | too short to reuse |
-| 2,046 / 2,022 | 165 ms | 351 ms | too short to reuse |
-| 3,633 / 4,002 | 156 ms | 744 ms | too short to reuse |
-| 6,823 / 8,019 | 183 ms | 1,432 ms | 677 ms |
-
-Up to about 1,000 tokens this setup, on the same machine as its client, answers within 20–70 ms
-of what the hosted API took for a client 50 ms away from it. Jev's time then stays nearly flat
-while this setup's grows by about 200 ms per 1,000 tokens read, so at 7,000–8,000 tokens Jev was
-about eight times faster than reading in full here, and four times faster than reading with the
-start reused. Because the benchmark repeated identical requests and TypeSafe does not say
-whether it caches, it is not known whether Jev's long-state figures include cached reads. Jev's
-serving hardware is not published; this setup is one RTX 5090 shared with chat, with the scoring
-network on the CPU, which accounts for about a quarter of the time on long prompts read in full.
-
-## Reuse of a prompt's start
+## Reuse on a game
 
 A test game with a 14,000-token fixed text and a log that gained five turns before each of 12
-decisions (`eval/game_test.py`):
+decisions, each asking which of six steps to take and whether energy is low
+(`eval/game_test.py`):
 
-| | Prompt | Reused | Total |
-|---|---|---|---|
-| first decision | 14,434 tokens | 0 | 3.0 s |
-| decisions 2–12 with reuse | 14,555–15,841 tokens | 10,864 | 0.95–1.25 s |
-| the same prompts read in full | | 0 | 2.66–3.01 s |
+| | Prompt | Reused | Total | Of which the scoring network |
+|---|---|---|---|---|
+| first decision, nothing to reuse | 14,434 tokens | 0 | 2.06 s | 97 ms |
+| decisions 2–12 | 14,555–15,841 tokens | 13,968 | 0.17–0.45 s | 27–48 ms |
 
-vLLM held back the last two matching 1,552-token blocks of every cache hit. Reading each prompt
-in full twice gave probabilities up to 0.141 apart, and reuse against the first full read up to
-0.119, so reuse stays within vLLM's own run-to-run variation. A game's start survived between
-48,000 and 60,000 tokens of other traffic in vLLM's cache (`eval/reuse_probe.py --threshold`).
+The time grows within the game until the state passes the next 1,552-token block boundary. Sent N
+at a time, with the same state and different questions in each round:
+
+| At once | New state, nothing cached | Five new turns | Same state, new questions |
+|---:|---:|---:|---:|
+| 1 | 2.53 s | 0.21 s | 0.23 s |
+| 2 | 2.04 s | 0.34 s | 0.27 s |
+| 4 | 2.10 s | 0.55 s | 0.55 s |
+| 8 | 2.31–2.52 s | 0.54–1.04 s | 0.52–1.03 s |
+
+When nothing is cached yet, only the first request reads the start; the others wait in vLLM's queue
+and then reuse it, so eight decisions take about as long as one full read. A game's start survived
+48,000 tokens of other traffic in vLLM's cache between two decisions and was gone after 60,000
+(`eval/reuse_probe.py --threshold`, measured with a 5 GiB cache of 194,648 token slots).

@@ -4,26 +4,27 @@
 # Before running it:
 #   pip install ./vllm-plugin          (into the environment vLLM runs in)
 #   the adapter in $CLEF_ADAPTER_DIR   (downloaded from Hugging Face, or built by extract/extract_adapter.py)
-# Then start the decision service against port 8000 (README, step 3).
+#   Clef's release files in $CLEF_RELEASE (service/fetch_release.py)
+# Then start the decision service against port 8000 with --gpu-head (README, step 4).
 #
 # Untested in this form: the plugin has run on the GPU only in the DFlash2 image
 # (examples/rtx5090-nvfp4-dflash2). Run eval/compare_hidden.py and eval/test_service.py on your
 # setup and compare with the published results before relying on it.
 set -euo pipefail
 : "${CLEF_ADAPTER_DIR:?set CLEF_ADAPTER_DIR to the adapter directory}"
+: "${CLEF_RELEASE:?set CLEF_RELEASE to the Clef release directory}"
 MODEL=${MODEL:-Qwen/Qwen3.8-27B}           # or a quantized Qwen3.8-27B checkpoint
 
-# The plugin writes the hidden states of decision requests here; the decision service reads them.
+# The plugin writes each decision's scores here; the decision service reads them.
 export CLEF_CAPTURE_DIR=/dev/shm/clef-hidden
 # Give adapter buffers only to the layers Clef changed (about 2.3 GB saved).
 export CLEF_LORA_LAYERS=40-63
+# Run Clef's scoring network inside vLLM, in bf16, with the starts of recent prompts kept in
+# system RAM; it needs about 0.5 GB of graphics memory.
+export CLEF_GPU_HEAD=1 CLEF_GPU_STORE_MB=400
 # With a speculative draft model: let decisions reuse every whole cached block (tested on the
 # DFlash2 fork of vLLM 0.27.2 only; see docs/how-it-works.md#how-much-vllm-reuses).
 # export CLEF_FULL_CACHE_HITS=1
-# Score decisions on the GPU inside vLLM (the decision service then runs with --gpu-head); needs
-# Clef's release files (service/fetch_release.py) and about 0.5 GB of graphics memory (network in bf16,
-# store of prompt starts in system RAM; CLEF_STORE_DEVICE=cuda keeps it on the GPU, about 1.6 GB).
-# export CLEF_GPU_HEAD=1 CLEF_RELEASE=/path/to/clef-release CLEF_GPU_STORE_MB=512
 
 exec vllm serve "$MODEL" \
     --served-model-name qwen3.8-27b \

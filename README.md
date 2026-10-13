@@ -1,71 +1,45 @@
 # Clef as a LoRA adapter on a vLLM server
 
-[Clef](https://huggingface.co/Cloudflare/clef) is Cloudflare's decision model: given a situation
-and a set of typed questions, it returns a probability for every allowed answer instead of
-writing text. It is built from Qwen3.8-27B, and its weights differ from the base model's only in
-decoder layers 40–63, by a change of rank 256. This repository turns that change back into a
-1.4 GB LoRA adapter and adds what a vLLM server needs to answer Clef's requests with it, so that a
-server already running Qwen3.8-27B for chat can also answer decisions at `POST /v1/systemone`
-(the request format of Clef's release and of TypeSafe's Jev), without a second copy of the model
-in graphics memory.
+[Clef](https://huggingface.co/Cloudflare/clef) is Cloudflare's decision model: you send it a
+situation and a set of typed questions, and it returns a probability for every allowed answer
+instead of writing text. It is Qwen3.8-27B with decoder layers 40–63 changed by a rank-256
+fine-tune, plus a small scoring network.
 
-It has four parts:
-
-- **the adapter**, published on Hugging Face as `<hf-user>/clef-lora-r256`, and rebuilt by
-  `extract/extract_adapter.py` from the two public models;
-- **a vLLM plugin** (`vllm-plugin/`) that writes the last layer's output for decision requests to
-  shared memory, because vLLM's API returns only tokens;
-- **a decision service** (`service/`) that tokenizes requests with Cloudflare's own code and answers
-  in the same format as Clef's release and TypeSafe's Jev. Clef's scoring network runs either in the
-  service on the CPU, from hidden states the plugin writes, or inside vLLM on the GPU
-  (`CLEF_GPU_HEAD=1` and `--gpu-head`), keeping prompt starts in NVFP4 in system RAM or graphics memory.
-  It reuses the start of prompts that grow at the end, such as a game's fixed rules plus a growing
-  log, which on the reference setup took a 15,000-token decision from 2.7–3.0 s to 0.95–1.25 s;
-- **evaluation** (`eval/`): 72 test records with the answers of Clef at full precision, and
-  scripts that compare a server's hidden states and answers with them.
+This repository turns that change back into a 1.4 GB LoRA adapter and adds a vLLM plugin and a
+small service, so that a vLLM server already running Qwen3.8-27B for chat also answers Clef's
+requests at `POST /v1/systemone` (the request format of Clef's release and of TypeSafe's Jev),
+from the same copy of the weights. Decisions whose prompt extends an earlier one, such as a
+game's fixed rules followed by a growing log, reuse the earlier prompt's start: on an RTX 5090 a
+16,000-token decision grown by four lines takes 180 ms instead of 2.1 s.
 
 How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md).
-
-## What has been tested
-
-| What | Status |
-|---|---|
-| Adapter fidelity | Rebuilt weights differ from Clef's by 0.17% at most, the size of bf16 rounding; what the factorisation leaves out is 0.85–1.005 times the rounding noise already in Clef's weights |
-| The whole path on a GPU | One setup: RTX 5090, a 4-bit NVFP4 checkpoint, a DFlash speculative draft model, vLLM 0.27.2.dev0 (a fork). 84 of 85 known answers right, against 83 for Clef at full precision; median 212 ms per decision ([details](examples/rtx5090-nvfp4-dflash2/README.md)) |
-| Stock vLLM 0.31.0 | Checked by reading its source only: every attribute the plugin uses exists with the same meaning, and 0.31 uses the model runner the GPU tests ran on. Not yet run on a GPU |
-| Other quantizations (bf16, FP8, AWQ, GPTQ) | Not tested |
-| Everything that needs no GPU | `eval/run-cpu-tests.sh`, about a minute |
-
-If you run it on another setup, please open an issue or pull request with what
-`eval/compare_hidden.py` and `eval/test_service.py` print, and it will be added to
-[Tested setups](#tested-setups).
 
 ## How a decision is served
 
 ```
-client ── POST /v1/systemone ──► decision service (service/service.py, CPU)
-                                   │ 1. tokenize with Cloudflare's encode_record and Clef's tokenizer
-                                   │ 2. POST /v1/completions: model "clef", token ids, max_tokens 1,
-                                   ▼    vllm_xargs {"clef_capture": KEY}
+client ── POST /v1/systemone ──► decision service (service/service.py)
+                                   │ tokenizes with Cloudflare's own code and Clef's tokenizer
+                                   ▼ POST /v1/completions: model "clef", token ids, max_tokens 1
                                  vLLM serving Qwen3.8-27B, with the adapter and the plugin
                                    │ the adapter applies to this request only; chat is unaffected
-                                   ▼ the plugin writes the prompt's hidden states
-                                 /dev/shm/clef-hidden/KEY.bin
+                                   │ the plugin runs Clef's scoring network on the GPU
+                                   ▼
+                                 $CLEF_CAPTURE_DIR/KEY.json: one score per option
                                    │
-                                 3. scoring network on the CPU → answer in the SystemOne format
+                                 decision service → answer in the SystemOne format
 ```
 
-The service and vLLM must share a filesystem for the capture files: the same machine, and for
-vLLM in Docker, `--ipc=host` or a mounted directory.
+The service and vLLM must share the capture directory: run them on the same machine, and for vLLM
+in Docker, mount the directory into the container.
 
 ## Requirements
 
-- vLLM serving Qwen3.8-27B, in any precision vLLM can apply a LoRA adapter to, with about 1.4 GB
-  of graphics memory to spare for the adapter's buffers.
-- For the service: Python 3.10 or later and `requirements.txt` (CPU-only torch is enough), about
-  3 GB of disk for the release files, and a few CPU cores.
-- For rebuilding the adapter yourself: about 25 minutes and 37 GB of downloads, of which only a
-  few tensors are on disk at once.
+- vLLM serving Qwen3.8-27B, in any precision vLLM can apply a LoRA adapter to, with about 2 GB of
+  graphics memory to spare: 1.4 GB for the adapter's buffers and about 0.5 GB for the scoring
+  network. On a full card, lower `--kv-cache-memory-bytes` by that much.
+- About 0.5 GB of system RAM for the starts of recent prompts.
+- For the service: Python 3.10 or later and `requirements.txt` (CPU-only torch is enough).
+- About 3 GB of disk for Clef's release files, which both vLLM and the service read.
 
 ## Quick start
 
@@ -75,48 +49,51 @@ vLLM in Docker, `--ipc=host` or a mounted directory.
 hf download <hf-user>/clef-lora-r256 --include "adapter_*" --local-dir clef-adapter
 ```
 
-or rebuild it from Cloudflare's and Qwen's releases:
+or rebuild it from Cloudflare's and Qwen's releases (about 25 minutes and 37 GB of downloads, of
+which only a few tensors are on disk at once):
 
 ```bash
 pip install -r requirements.txt
 python extract/extract_adapter.py clef-adapter
 ```
 
-**2. Start vLLM with the plugin and the adapter.** Install the plugin into vLLM's environment
+**2. Get Clef's release files** (2.8 GB: the tokenizer, the scoring network and Cloudflare's code):
+
+```bash
+python service/fetch_release.py clef-release
+```
+
+**3. Start vLLM with the plugin and the adapter.** Install the plugin into vLLM's environment
 (`pip install ./vllm-plugin`, or build an image with `vllm-plugin/Dockerfile`), then start vLLM
 as you normally do, adding:
 
 ```bash
-export CLEF_CAPTURE_DIR=/dev/shm/clef-hidden   # where the plugin writes
-export CLEF_LORA_LAYERS=40-63                  # adapter buffers only for the layers Clef changed
+export CLEF_CAPTURE_DIR=/dev/shm/clef-hidden    # where the plugin writes each decision's scores
+export CLEF_LORA_LAYERS=40-63                   # adapter buffers only for the layers Clef changed
+export CLEF_GPU_HEAD=1                          # run Clef's scoring network inside vLLM
+export CLEF_RELEASE=/path/to/clef-release       # from step 2, readable inside vLLM's container
+export CLEF_GPU_STORE_MB=400                    # system RAM for the starts of recent prompts
+export CLEF_FULL_CACHE_HITS=1                   # with a speculative draft model, see below
 vllm serve Qwen/Qwen3.8-27B ... \
     --enable-lora --max-lora-rank 256 --max-loras 1 --max-cpu-loras 1 \
     --lora-modules clef=/path/to/clef-adapter --enable-prefix-caching
 ```
 
-`examples/vllm-serve.sh` is a complete command; `examples/rtx5090-nvfp4-dflash2/` is the setup
-that was measured. vLLM's log should show `clef_capture: patched` and
-`LoRA buffers limited to decoder layers 40-63`.
+vLLM's log should show `clef_capture: patched` and `LoRA buffers limited to decoder layers 40-63`.
+`examples/vllm-serve.sh` is a complete command, and `examples/rtx5090-nvfp4-dflash2/` is the
+Docker Compose overlay of the tested setup.
 
-To run the scoring network on the GPU as well, also set `CLEF_GPU_HEAD=1` and
-`CLEF_RELEASE=/path/to/clef-release` (the directory from step 3, readable inside vLLM's container) and,
-optionally, `CLEF_GPU_STORE_MB` (default 512), `CLEF_STORE_DEVICE` (`cpu`, the default, or `cuda`) and
-`CLEF_GPU_HEAD_DTYPE` (`bfloat16`, the default, or `float32`). Leave the scoring about 0.5 GB of
-graphics memory with the defaults, about 1.6 GB with the store on the GPU (on a full card, by lowering
-`--kv-cache-memory-bytes`). Start the service in step 3 with `--gpu-head`.
-
-**3. Start the decision service.**
+**4. Start the decision service.**
 
 ```bash
-python service/fetch_release.py clef-release      # 2.8 GB: tokenizer, scoring network, code
 python service/service.py --release clef-release --vllm http://127.0.0.1:8000 \
-    --capture-dir /dev/shm/clef-hidden --listen 127.0.0.1:8091
+    --capture-dir /dev/shm/clef-hidden --listen 127.0.0.1:8091 --gpu-head --max-length 32768
 ```
 
-The service loads Cloudflare's `joint_schema_model.py` from the release directory rather than
-from this repository. `service/clef-decider.service` is a systemd unit for it.
+`--max-length` is the longest decision prompt accepted, in tokens; without it the limit is 16,384,
+the default of Cloudflare's code. `service/clef-decider.service` is a systemd unit for the service.
 
-**4. Ask a question.**
+**5. Ask a question.**
 
 ```bash
 curl -s 127.0.0.1:8091/v1/systemone -H 'Content-Type: application/json' -d '{
@@ -129,11 +106,14 @@ curl -s 127.0.0.1:8091/v1/systemone -H 'Content-Type: application/json' -d '{
     "outage": {"type": "noul", "instructions": "Is a service down?"}}}'
 ```
 
-Status codes: 200 answered; 400 malformed, contains pictures, or longer than 16,384 tokens; 502
-vLLM did not answer or does not serve the adapter; 504 vLLM answered but no hidden states arrived
-within 10 seconds (the plugin is not loaded, or the capture directory is not shared).
+| Status | Meaning |
+|---|---|
+| 200 | answered |
+| 400 | the request is malformed, contains pictures, or is longer than `--max-length` |
+| 502 | vLLM did not answer, does not serve the adapter, or the scoring failed |
+| 504 | vLLM answered, but no scores arrived within 10 seconds: the plugin is not loaded, or the capture directory is not shared |
 
-**5. Check your setup against Clef at full precision.**
+**6. Check your setup against Clef at full precision.**
 
 ```bash
 python eval/build_records.py                       # the 72 test records, from public datasets
@@ -146,83 +126,77 @@ python eval/compare_hidden.py http://127.0.0.1:8000 /dev/shm/clef-hidden referen
 `test_service.py` prints, per group, how many answers agree with Clef at full precision and how
 many match the known right answer; Clef itself gets 83 of the 85 known answers right.
 `compare_hidden.py` compares the last layer's output with and without the adapter against the
-reference; with the adapter it should be far closer. `eval/speed_probe.py` measures what loading
-the adapter costs your chat traffic: run it once without the adapter and once with it.
+reference; with the adapter it should be far closer.
 
-## Reusing the start of long prompts
+## Writing prompts that reuse their start
 
-When consecutive decisions share a long start, vLLM skips that part of the prompt, and the service
-fills in what the scoring network needs from rows it kept from the earlier prompt; the answer is
-the same as reading in full, to 1.2 × 10⁻⁷ on the CPU. For this to happen, send the state as one
-string with the unchanging text first and new events appended at the end, and keep anything
-rewritten each turn at the end too. Do not send the state as a JSON object: Clef writes JSON with
-sorted keys, which can move the growing part before the fixed part. Questions can change freely,
-since they come after the state. Each response's `timings.reused_tokens` shows what was reused.
-vLLM reuses only whole blocks (1,552 tokens for this model) and, with a speculative draft model,
-holds back the last one or two, so the shared start has to exceed about 3,100–4,700 tokens before
-anything is reused. `CLEF_FULL_CACHE_HITS=1` in vLLM's environment makes the plugin skip the
-held-back blocks for decisions only; on the measured setup that took a grown 64k decision from
-1.46 s to 0.48 s, a grown 16k one from 0.91 s to 0.25 s and a grown 8k one from 0.70 s to 0.20 s,
-with no measurable effect on chat. Details:
-[docs/how-it-works.md](docs/how-it-works.md#how-much-vllm-reuses).
+vLLM skips the part of a prompt it has already read, and the plugin fills in what the scoring
+network needs for that part from what it kept of the earlier prompt; the answer is the same as
+reading in full. For this to happen:
 
-## Tested setups
+- Send the state as one string, with the unchanging text first and new events appended at the
+  end. Keep anything rewritten each turn at the end too.
+- Do not send the state as a JSON object: Clef writes JSON with sorted keys, which can move the
+  growing part in front of the fixed part.
+- Questions can change freely, since they come after the state.
 
-| GPU | Checkpoint and cache | vLLM | Known answers right (of 85) | Agree with reference (of 87) | Median decision | Chat decode with the adapter |
-|---|---|---|---|---|---|---|
-| RTX 5090, 32 GB | NVFP4 (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`), NVFP4 cache, DFlash draft model | 0.27.2.dev0 fork | 84 (later runs 83, 85) | 84 | 212 ms | 15% slower (243 → 206 tokens/s) |
+vLLM reuses only whole blocks, 1,552 tokens for this model, so a decision reads up to 1,551
+tokens of the older prompt again, plus whatever is new. With a speculative draft model, vLLM also
+holds back the last one or two matching blocks of every cache hit; `CLEF_FULL_CACHE_HITS=1` turns
+that off for decisions only, leaving chat as it was. Each response's `timings.reused_tokens`
+shows how many tokens were reused.
 
-With the scoring network on the GPU (bf16, prompt starts in system RAM) and `CLEF_FULL_CACHE_HITS=1`,
-the same setup answered a decision whose prompt had grown in 146–187 ms up to 16,000 tokens and 293 ms
-at 32,000, and one read in full in 1.04 s at 8,000 tokens and 4.8 s at 32,000, for about 0.5 GB of
-graphics memory ([details](docs/how-it-works.md#the-scoring-network-on-the-gpu)).
+## Tested setup
 
-Measured earlier on the same setup, with the network on the CPU, `eval/latency_sweep.py` timed one question about prompts of 310 to 64,015
-tokens: 177 ms at 310 tokens, 1.4 s at 8,000 and about 17 s at 64,000 when read in full, and about
-0.7 s, 0.8–0.9 s and 1.5 s at 8,000, 16,000 and 64,000 tokens when the start was reused; with
-`CLEF_FULL_CACHE_HITS=1` (below), 0.20 s, 0.25 s and 0.48 s. The
-[worked example](examples/rtx5090-nvfp4-dflash2/README.md#latency-by-prompt-length-and-against-jev)
-compares these with the published figures for TypeSafe's Jev.
-| Clef at bf16, CPU (the reference) | — | — | 83 | — | — | — |
+One setup so far: an RTX 5090 (32 GB) running `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`
+(4-bit) with a 4-bit key-value cache and a DFlash speculative draft model, in the DFlash2 image
+(a fork of vLLM 0.27.2.dev0), with the settings in step 3.
+
+- **Answers:** on the 72 test records, 83–85 of the 85 known answers right across runs, against 83
+  for Clef at full precision; answers close to an even split can flip between runs.
+- **Time per decision:**
+
+  | Prompt tokens | Read in full | Grown by four lines |
+  |---:|---:|---:|
+  | 310 | 137 ms | 147 ms |
+  | 4,002 | 475 ms | 145 ms |
+  | 16,002 | 2,054 ms | 180 ms |
+  | 32,013 | 4,926 ms | 311 ms |
+
+- **Cost to chat:** the adapter and the scoring network came out of the key-value cache (6.5 →
+  4.75 GiB), so the longest chat request is 181,000 tokens instead of 262,144, and six requests
+  run at once instead of eight. Whether the adapter slows decoding could not be separated from
+  the variation between vLLM starts (205–264 tokens/s for one conversation).
+
+Details: [examples/rtx5090-nvfp4-dflash2/README.md](examples/rtx5090-nvfp4-dflash2/README.md).
+
+Stock vLLM 0.31.0 has been checked only by reading its source: every attribute the plugin uses
+exists with the same meaning. Other GPUs and quantizations (bf16, FP8, AWQ, GPTQ) have not been
+tested. If you run it on another setup, please open an issue or pull request with what
+`eval/compare_hidden.py` and `eval/test_service.py` print.
 
 ## Limits
 
 - **Text and JSON only.** Clef's code tokenizes its prompt in pieces, and the result differs from
   tokenizing the whole prompt at once, so pictures cannot be passed through vLLM's chat endpoint
-  as Clef was trained. vLLM's token-in, token-out endpoint (`/inference/v1/generate`) accepts
-  exact token ids together with picture data and is the route to investigate.
-- **16,384 tokens per decision by default**, the default of Cloudflare's released code. Longer
-  prompts are refused rather than shortened. `service.py --max-length 65536` allows up to 64k,
-  the context Cloudflare states for Clef; prompts of 32,000 and 64,000 tokens ran on the measured
-  setup, but Clef's accuracy beyond 16,384 tokens has not been tested here.
-- **Chat pays while the adapter is loaded**, whether or not decisions are being made: 15% slower
-  decode and a shorter longest request on the measured setup, from vLLM's LoRA support and from
-  the memory the adapter takes.
+  as Clef was trained.
+- **Prompt length.** 32,768 tokens on the tested setup; Clef's accuracy beyond 16,384 tokens has
+  not been tested.
+- **Chat pays while the adapter is loaded**, whether or not decisions are being made: the memory
+  the adapter and the scoring network take comes out of chat's key-value cache.
 - **One adapter** (`--max-loras 1`).
 - **The plugin depends on vLLM internals.** It logs a warning on versions other than the tested
-  ones. With vLLM's adaptive draft verification enabled (a "dspark" option, off by default), it
-  refuses to capture rather than risk misplacing rows.
+  ones.
 
 ## Repository layout
 
 | Path | What it is |
 |---|---|
 | `extract/extract_adapter.py` | rebuilds the adapter from `Cloudflare/clef` and `Qwen/Qwen3.8-27B` at pinned revisions |
-| `extract/delta_rank.py` | prints the singular values of Clef's change to any tensor |
-| `vllm-plugin/` | the `clef_capture` plugin (capture, scoring on the GPU, its NVFP4 store of prompt starts), its tests and a Dockerfile |
-| `service/service.py` | the decision service |
-| `service/reuse.py` | the scoring network over kept rows, and the store of prompt starts |
-| `service/fetch_release.py` | downloads the release files the service needs |
-| `service/clef_code.py` | loads Cloudflare's `joint_schema_model.py` from the release |
-| `service/mock_vllm.py` | a stand-in for vLLM, for testing without a GPU |
-| `eval/build_records.py`, `eval/reference/` | the 72 test records and Clef's answers to them at full precision |
-| `eval/test_service.py`, `eval/compare_hidden.py` | compare a server's answers and hidden states with the reference |
-| `eval/game_test.py`, `eval/reuse_probe.py` | reuse of prompt starts: correctness, and when vLLM reuses |
-| `eval/speed_probe.py` | chat speed, to measure the adapter's cost |
-| `eval/latency_sweep.py` | decision latency against prompt length, read in full and with the start reused |
-| `eval/reference.py` | how the reference answers were produced (Clef in bf16 on the CPU) |
-| `eval/run-cpu-tests.sh` | every test that needs no GPU |
-| `examples/` | a stock vLLM command, and the measured RTX 5090 setup |
+| `vllm-plugin/` | the `clef_capture` plugin (scoring on the GPU and the store of prompt starts), its tests and a Dockerfile |
+| `service/` | the decision service, `fetch_release.py` for Clef's release files, and a systemd unit |
+| `eval/` | the 72 test records with Clef's answers at full precision, and scripts that compare a server with them |
+| `examples/` | a stock vLLM command, and the tested RTX 5090 setup |
 
 ## Related projects
 

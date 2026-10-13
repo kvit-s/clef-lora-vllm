@@ -8,3 +8,4 @@ __pycache__/
 *.pyc
 compare-hidden.json
 !examples/rtx5090-nvfp4-dflash2/compare-hidden.json
+.clauding
