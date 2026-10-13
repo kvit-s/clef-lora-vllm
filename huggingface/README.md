@@ -29,6 +29,9 @@ questions: its hidden states go to Clef's scoring network, which is in Cloudflar
 code that connects the two, a vLLM plugin and a decision service answering `POST /v1/systemone`,
 is at https://github.com/kvit-s/clef-lora-vllm.
 
+The blog post [Running Two 27B Models on a Single RTX 5090](https://blog.kvit.app/posts/two-27b-models-on-single-rtx5090/)
+tells how this setup came about and compares its latency with TypeSafe's Jev.
+
 ## Files
 
 | File | What it is |
