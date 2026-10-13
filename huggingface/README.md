@@ -1,7 +1,10 @@
 ---
 license: apache-2.0
 library_name: peft
-base_model: Qwen/Qwen3.8-27B
+base_model:
+- Cloudflare/clef
+- Qwen/Qwen3.8-27B
+base_model_relation: adapter
 tags:
 - clef
 - lora
