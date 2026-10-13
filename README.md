@@ -12,7 +12,9 @@ from the same copy of the weights. Decisions whose prompt extends an earlier one
 game's fixed rules followed by a growing log, reuse the earlier prompt's start: on an RTX 5090 a
 16,000-token decision grown by four lines takes 180 ms instead of 2.1 s.
 
-How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md).
+How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). The blog post
+[Running Two 27B Models on a Single RTX 5090](https://blog.kvit.app/posts/two-27b-models-on-single-rtx5090/)
+tells how this setup came about and compares its latency with TypeSafe's Jev.
 
 ## How a decision is served
 
