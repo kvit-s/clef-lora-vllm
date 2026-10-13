@@ -46,7 +46,7 @@ in Docker, mount the directory into the container.
 **1. Get the adapter.** Download it:
 
 ```bash
-hf download <hf-user>/clef-lora-r256 --include "adapter_*" --local-dir clef-adapter
+hf download kvit-s/clef-lora-r256 --include "adapter_*" --local-dir clef-adapter
 ```
 
 or rebuild it from Cloudflare's and Qwen's releases (about 25 minutes and 37 GB of downloads, of
@@ -118,7 +118,7 @@ curl -s 127.0.0.1:8091/v1/systemone -H 'Content-Type: application/json' -d '{
 ```bash
 python eval/build_records.py                       # the 72 test records, from public datasets
 python eval/test_service.py http://127.0.0.1:8091  # answers against the reference answers
-hf download <hf-user>/clef-lora-r256 --include "reference/hidden/*" --local-dir .
+hf download kvit-s/clef-lora-r256 --include "reference/hidden/*" --local-dir .
 python eval/compare_hidden.py http://127.0.0.1:8000 /dev/shm/clef-hidden reference/hidden \
     --base qwen3.8-27b --release clef-release --limit 16
 ```

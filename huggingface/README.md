@@ -24,7 +24,7 @@ With it, a vLLM server that already runs Qwen3.8-27B for chat can also answer Cl
 requests, applying the adapter only to those requests. Clef's backbone alone does not answer
 questions: its hidden states go to Clef's scoring network, which is in Cloudflare's release. The
 code that connects the two, a vLLM plugin and a decision service answering `POST /v1/systemone`,
-is at https://github.com/<github-user>/clef-lora-vllm.
+is at https://github.com/kvit-s/clef-lora-vllm.
 
 ## Files
 
@@ -58,9 +58,9 @@ out measures 0.85 to 1.005 times that rounding noise, and for the smaller matric
 it. Weights rebuilt as base + B·A differ from Clef's by 0.17% at most.
 
 Applied to a quantized base model, the adapter reproduces Clef less closely. On one RTX 5090
-setup (a 4-bit NVFP4 checkpoint with a 4-bit cache, in vLLM) it answered 84 of 85 test questions
-with known answers correctly, where Clef at full precision answered 83, and the median decision
-took 212 ms. The GitHub repository has the details and the scripts to measure other setups.
+setup (a 4-bit NVFP4 checkpoint with a 4-bit cache, in vLLM) it answered 83 to 85 of 85 test
+questions with known answers correctly across runs, where Clef at full precision answered 83, and
+the median decision took 165 ms. The GitHub repository has the details and the scripts to measure other setups.
 
 ## Use with vLLM
 
@@ -68,7 +68,7 @@ took 212 ms. The GitHub repository has the details and the scripts to measure ot
 export CLEF_LORA_LAYERS=40-63                  # read by the clef_capture plugin
 vllm serve Qwen/Qwen3.8-27B ... \
     --enable-lora --max-lora-rank 256 --max-loras 1 \
-    --lora-modules clef=<hf-user>/clef-lora-r256
+    --lora-modules clef=kvit-s/clef-lora-r256
 ```
 
 Requests to the model name `clef` then run Clef's backbone; the plugin and the decision service
